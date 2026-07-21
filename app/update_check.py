@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -42,6 +43,10 @@ def _dismissed_path() -> Path:
     return get_data_dir() / "dismissed_update.json"
 
 
+def _config_path() -> Path:
+    return get_data_dir() / "config.json"
+
+
 def _parse_version(value: str) -> tuple[int, ...]:
     text = (value or "").strip().lstrip("vV")
     parts: list[int] = []
@@ -76,11 +81,33 @@ def dismiss_update(version: str) -> None:
     )
 
 
+def _github_token() -> str:
+    env = (os.environ.get("FULFILMENT_CHECKER_GITHUB_TOKEN") or "").strip()
+    if env:
+        return env
+    path = _config_path()
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return str(
+            data.get("github_update_token")
+            or data.get("github_token")
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
 def _headers() -> dict[str, str]:
-    return {
+    headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": f"Fulfilment-Checker/{app_metadata()['version']}",
     }
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def _version_from_release(payload: dict) -> str:
@@ -97,7 +124,7 @@ def _version_from_release(payload: dict) -> str:
 
 def _fetch_latest_release() -> UpdateInfo | None:
     response = requests.get(RELEASES_API, headers=_headers(), timeout=8)
-    if response.status_code == 404:
+    if response.status_code in {401, 403, 404}:
         return None
     response.raise_for_status()
     payload = response.json()
@@ -114,7 +141,11 @@ def _fetch_latest_release() -> UpdateInfo | None:
 
 
 def _fetch_latest_tag() -> UpdateInfo | None:
-    response = requests.get(TAGS_API, headers=_headers(), timeout=8, params={"per_page": 10})
+    response = requests.get(
+        TAGS_API, headers=_headers(), timeout=8, params={"per_page": 10}
+    )
+    if response.status_code in {401, 403, 404}:
+        return None
     response.raise_for_status()
     tags = response.json()
     if not isinstance(tags, list):
@@ -138,7 +169,7 @@ def _fetch_remote_pyproject_version() -> UpdateInfo | None:
     for url in RAW_PYPROJECT_CANDIDATES:
         try:
             response = requests.get(url, headers=_headers(), timeout=8)
-            if response.status_code == 404:
+            if response.status_code in {401, 403, 404}:
                 continue
             response.raise_for_status()
             match = _VERSION_RE.search(response.text)
@@ -158,15 +189,18 @@ def _fetch_remote_pyproject_version() -> UpdateInfo | None:
 
 def check_for_update() -> UpdateInfo | None:
     """Return update info when GitHub has a newer version than this build."""
-    current = app_metadata()["version"]
     candidates: list[UpdateInfo] = []
 
-    for fetcher in (_fetch_latest_release, _fetch_latest_tag, _fetch_remote_pyproject_version):
+    for fetcher in (
+        _fetch_latest_release,
+        _fetch_latest_tag,
+        _fetch_remote_pyproject_version,
+    ):
         try:
             info = fetcher()
         except Exception:
             continue
-        if info and is_newer(info.latest_version, current):
+        if info and is_newer(info.latest_version, info.current_version):
             candidates.append(info)
 
     if not candidates:
