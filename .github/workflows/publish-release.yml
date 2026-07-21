@@ -48,7 +48,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ steps.version.outputs.tag }}
+          # Manual runs use the selected branch (usually main) so fixes are included.
+          # Tag pushes build the exact tagged commit.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || steps.version.outputs.tag }}
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
@@ -102,7 +104,7 @@ jobs:
       - name: Install dependencies
         run: |
           uv venv
-          uv pip install "flet[all]==0.85.3" pdfminer.six openpyxl fpdf2 pymupdf google-api-python-client google-auth-oauthlib google-auth-httplib2 msal requests
+          uv pip install "flet[all]==0.85.3" pdfminer.six openpyxl fpdf2 google-api-python-client google-auth-oauthlib google-auth-httplib2 msal requests
 
       - name: Accept Android SDK licenses
         run: |

@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "flet>=0.24.0",
     "pdfminer.six>=20221105",
-    "pymupdf>=1.24.0",
+    # pymupdf has no Android wheels — desktop optional only (see optional-dependencies)
     "openpyxl>=3.1.0",
     "fpdf2>=2.8.0",
     "google-api-python-client>=2.100.0",
@@ -17,13 +17,18 @@ dependencies = [
     "requests>=2.31.0",
 ]
 
+[project.optional-dependencies]
+desktop = [
+    "pymupdf>=1.24.0",
+]
+
 [tool.flet]
 org = "com.deks"
 product = "Picking Barcode Scanner"
 company = "DEKS"
 copyright = "Copyright (C) 2026 DEKS Industries Pty Ltd"
-build_version = "1.8.0"
-build_number = 15
+build_version = "1.8.1"
+build_number = 16
 
 [tool.flet.app]
 path = "."
