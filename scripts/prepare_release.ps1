@@ -60,13 +60,12 @@ Write-Host "Next steps:" -ForegroundColor Cyan
 Write-Host "  1. Bump tool.flet.build_version / build_number in pyproject.toml"
 Write-Host "  2. git add, commit, push to main"
 Write-Host "  3. git tag vX.Y.Z && git push origin vX.Y.Z"
-Write-Host "     (Publish Release workflow creates the GitHub Release)"
-Write-Host "  4. Installed apps show an update banner when GitHub has a newer version"
+Write-Host "     (Publish Release workflow builds the APK and attaches it to the GitHub Release)"
+Write-Host "  4. Or for an existing tag: Actions → Publish Release → Run workflow → enter vX.Y.Z"
+Write-Host "  5. Installed apps show an update banner when GitHub has a newer version"
 Write-Host "     Private repos: set data/config.json github_update_token (read-only)"
 Write-Host "     or make the repository public."
-Write-Host "  5. GitHub Actions - Build Android APK - Run workflow"
-Write-Host "  6. Download picker-check-apk artifact"
-Write-Host "  7. Install on tablet over existing app"
+Write-Host "  6. Download the APK from the GitHub Release page and install on the tablet"
 Write-Host ""
 
 try {

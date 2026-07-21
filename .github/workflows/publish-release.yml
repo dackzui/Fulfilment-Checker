@@ -1,39 +1,158 @@
 name: Publish Release
 
-# Creates a GitHub Release whenever a version tag is pushed.
-# Apps check this release (and pyproject.toml on main) to show the update banner.
+# On version tags (v*), build the signed APK and attach it to the GitHub Release.
+# Also runnable manually for an existing tag (e.g. v1.8.0) via Actions → Run workflow.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish, e.g. v1.8.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+env:
+  PYTHONUTF8: 1
+  FLET_CLI_NO_RICH_OUTPUT: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  KEYSTORE_PATH: ${{ github.workspace }}/upload-keystore.jks
+
 jobs:
   release:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+    timeout-minutes: 90
 
-      - name: Read version from tag
+    steps:
+      - name: Resolve tag
         id: version
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) TAG="v${TAG}" ;;
+          esac
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG (version $VERSION)"
 
-      - name: Create GitHub Release
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.version.outputs.tag }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Verify required project files
+        run: |
+          set -e
+          test -f pyproject.toml
+          test -f main.py
+          test -d app
+          test -f assets/icon.png
+
+      - name: Verify Android signing secrets
+        run: |
+          set -e
+          missing=0
+          if [ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "::error::Missing secret ANDROID_KEYSTORE_BASE64"
+            missing=1
+          fi
+          if [ -z "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" ]; then
+            echo "::error::Missing secret ANDROID_KEYSTORE_PASSWORD"
+            missing=1
+          fi
+          if [ -z "${{ secrets.ANDROID_KEY_PASSWORD }}" ]; then
+            echo "::error::Missing secret ANDROID_KEY_PASSWORD"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "Add repository secrets under Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+      - name: Decode Android keystore
+        run: |
+          set -e
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | tr -d '\r\n ' | base64 --decode > "$KEYSTORE_PATH"
+          test -s "$KEYSTORE_PATH"
+
+      - name: Validate Android keystore
+        env:
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'upload' }}
+        run: |
+          set -e
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$KEYSTORE_PASS" -alias "$KEY_ALIAS"
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install "flet[all]==0.85.3" pdfminer.six openpyxl fpdf2 pymupdf google-api-python-client google-auth-oauthlib google-auth-httplib2 msal requests
+
+      - name: Accept Android SDK licenses
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+
+      - name: Build signed APK
+        env:
+          FLET_ANDROID_SIGNING_KEY_STORE: ${{ env.KEYSTORE_PATH }}
+          FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          FLET_ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'upload' }}
+          FLET_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          uv run flet build apk --yes -vv 2>&1 | tee build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Show build failure details
+        if: failure()
+        run: |
+          tail -n 120 build.log 2>/dev/null || true
+          find build -type f 2>/dev/null || true
+
+      - name: Name APK for release
+        id: apk
+        run: |
+          set -e
+          APK=$(find build/apk -name '*.apk' | head -n 1)
+          test -n "$APK"
+          DEST="build/apk/PickingBarcodeScanner-v${{ steps.version.outputs.version }}.apk"
+          cp "$APK" "$DEST"
+          echo "path=$DEST" >> "$GITHUB_OUTPUT"
+          ls -lh "$DEST"
+
+      - name: Remove keystore from runner
+        if: always()
+        run: rm -f "$KEYSTORE_PATH"
+
+      - name: Create / update GitHub Release with APK
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Picking Barcode Scanner v${{ steps.version.outputs.version }}
           generate_release_notes: true
+          files: ${{ steps.apk.outputs.path }}
+          fail_on_unmatched_files: true
           body: |
             ## Picking Barcode Scanner v${{ steps.version.outputs.version }}
 
-            A new version is available. Update your desktop/tablet install to get the latest picking helper, scan, and sync improvements.
+            A new version is available. Download the APK below and install it over your existing tablet app.
 
             Repository: https://github.com/dackzui/Fulfilment-Checker
