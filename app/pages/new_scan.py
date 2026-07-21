@@ -89,8 +89,12 @@ def build(
     pick_sort_method = {"value": "model_i"}
     draft_session_id: int | None = resume_session_id
     window_height = getattr(getattr(page, "window", None), "height", None) or page.height or 800
-    ITEMS_PANEL_HEIGHT = max(320, min(460, int(window_height) - 460))
-    ITEMS_LIST_HEIGHT = ITEMS_PANEL_HEIGHT - 40
+    # Leave room for the form above; panels fill remaining height.
+    ITEMS_PANEL_HEIGHT = max(360, min(520, int(window_height) - 420))
+    LIST_HEADER_HEIGHT = 40
+    # Blue-bordered list area = panel height minus padding, title row, and spacing.
+    ITEMS_LIST_HEIGHT = max(260, ITEMS_PANEL_HEIGHT - 72)
+    ITEMS_LIST_BODY_HEIGHT = max(200, ITEMS_LIST_HEIGHT - LIST_HEADER_HEIGHT)
 
     def format_person_name_field(field: ft.TextField):
         if field.value:
@@ -391,8 +395,6 @@ def build(
             return "partial"
         return "empty"
 
-    LIST_HEADER_HEIGHT = 40
-
     def _equal_header(label: str) -> ft.Container:
         return ft.Container(
             expand=True,
@@ -406,7 +408,11 @@ def build(
             ),
         )
 
-    ordered_list = ft.ListView(spacing=0, padding=0, expand=True)
+    ordered_list = ft.ListView(
+        spacing=0,
+        padding=ft.Padding.only(bottom=12),
+        expand=True,
+    )
     ordered_header = ft.Container(
         height=LIST_HEADER_HEIGHT,
         bgcolor=BG_TABLE,
@@ -426,7 +432,11 @@ def build(
         ),
     )
 
-    scanned_list = ft.ListView(spacing=0, padding=0, expand=True)
+    scanned_list = ft.ListView(
+        spacing=0,
+        padding=ft.Padding.only(bottom=12),
+        expand=True,
+    )
     scanned_header = ft.Container(
         height=LIST_HEADER_HEIGHT,
         bgcolor=BG_TABLE,
@@ -624,7 +634,6 @@ def build(
             padding=12,
         ),
         height=ITEMS_LIST_HEIGHT,
-        expand=True,
     )
 
     def _pick_bay_for_part(part_no: str) -> str:
@@ -699,8 +708,9 @@ def build(
             [
                 ordered_header,
                 ft.Container(
-                    height=ITEMS_LIST_HEIGHT - LIST_HEADER_HEIGHT,
+                    height=ITEMS_LIST_BODY_HEIGHT,
                     content=ordered_list,
+                    clip_behavior=ft.ClipBehavior.HARD_EDGE,
                 ),
             ],
             spacing=0,
@@ -1449,16 +1459,15 @@ def build(
             [
                 scanned_header,
                 ft.Container(
-                    height=ITEMS_LIST_HEIGHT - LIST_HEADER_HEIGHT,
+                    height=ITEMS_LIST_BODY_HEIGHT,
                     content=scanned_list,
-                    expand=True,
+                    clip_behavior=ft.ClipBehavior.HARD_EDGE,
                 ),
             ],
             spacing=0,
-            expand=True,
+            tight=True,
         ),
         height=ITEMS_LIST_HEIGHT,
-        expand=True,
     )
 
     table_container = ft.Container(
