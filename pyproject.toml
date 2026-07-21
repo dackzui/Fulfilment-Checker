@@ -1,0 +1,45 @@
+[project]
+name = "picker-check"
+version = "1.0.0"
+description = "Picking Barcode Scanner - warehouse picking verification"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flet>=0.24.0",
+    "pdfminer.six>=20221105",
+    "pymupdf>=1.24.0",
+    "openpyxl>=3.1.0",
+    "fpdf2>=2.8.0",
+    "google-api-python-client>=2.100.0",
+    "google-auth-oauthlib>=1.2.0",
+    "google-auth-httplib2>=0.2.0",
+    "msal>=1.28.0",
+    "requests>=2.31.0",
+]
+
+[tool.flet]
+org = "com.deks"
+product = "Picking Barcode Scanner"
+company = "DEKS"
+copyright = "Copyright (C) 2026 DEKS Industries Pty Ltd"
+build_version = "1.8.0"
+build_number = 15
+
+[tool.flet.app]
+path = "."
+module = "main"
+exclude = [
+    ".venv",
+    "__pycache__",
+    "data/scanner.db",
+    "data/admins.json",
+    "data/cloud_credentials.json",
+    "data/cloud_tokens",
+    "data/exports",
+    "agent-tools",
+]
+
+[tool.flet.android]
+# Black matches the DEKS sidebar logo background
+adaptive_icon_background = "#000000"
+splash_color = "#F0F0F0"

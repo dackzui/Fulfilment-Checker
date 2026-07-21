@@ -1,0 +1,143 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHONUTF8: 1
+  FLET_CLI_NO_RICH_OUTPUT: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  KEYSTORE_PATH: ${{ github.workspace }}/upload-keystore.jks
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Verify required project files
+        run: |
+          set -e
+          echo "Checking project layout..."
+          test -f pyproject.toml || (echo "Missing pyproject.toml" && exit 1)
+          test -f main.py || (echo "Missing main.py" && exit 1)
+          test -d app || (echo "Missing app/ folder" && exit 1)
+          test -f assets/icon.png || (echo "Missing assets/icon.png - copy the assets folder from the project" && exit 1)
+          for f in \
+            app/main_app.py \
+            app/item_grouping.py \
+            app/history_export.py \
+            app/barcode_catalog.py \
+            app/pages/new_scan.py \
+            app/pages/history.py; do
+            test -f "$f" || (echo "Missing required file: $f" && exit 1)
+          done
+          ls -la assets/
+          ls -la app/
+
+      - name: Verify Android signing secrets
+        run: |
+          set -e
+          missing=0
+          if [ -z "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "::error::Missing secret ANDROID_KEYSTORE_BASE64"
+            missing=1
+          fi
+          if [ -z "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" ]; then
+            echo "::error::Missing secret ANDROID_KEYSTORE_PASSWORD"
+            missing=1
+          fi
+          if [ -z "${{ secrets.ANDROID_KEY_PASSWORD }}" ]; then
+            echo "::error::Missing secret ANDROID_KEY_PASSWORD"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo ""
+            echo "Add repository secrets under Settings → Secrets and variables → Actions:"
+            echo "  ANDROID_KEYSTORE_BASE64  — base64-encoded upload-keystore.jks"
+            echo "  ANDROID_KEYSTORE_PASSWORD"
+            echo "  ANDROID_KEY_ALIAS        — optional, defaults to upload"
+            echo "  ANDROID_KEY_PASSWORD"
+            exit 1
+          fi
+
+      - name: Decode Android keystore
+        run: |
+          set -e
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | tr -d '\r\n ' | base64 --decode > "$KEYSTORE_PATH"
+          test -s "$KEYSTORE_PATH"
+
+      - name: Validate Android keystore
+        env:
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'upload' }}
+        run: |
+          set -e
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$KEYSTORE_PASS" -alias "$KEY_ALIAS"
+          echo "Keystore and alias validated OK"
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install "flet[all]==0.85.3" pdfminer.six openpyxl fpdf2 google-api-python-client google-auth-oauthlib google-auth-httplib2 msal requests
+
+      - name: Verify Python imports
+        run: |
+          uv run python -c "
+          from app.main_app import main
+          from app.pages import home, new_scan, history
+          from app.item_grouping import box_qty_display
+          print('Python imports OK')
+          "
+
+      - name: Accept Android SDK licenses
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+
+      - name: Build signed APK
+        env:
+          FLET_ANDROID_SIGNING_KEY_STORE: ${{ env.KEYSTORE_PATH }}
+          FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          FLET_ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'upload' }}
+          FLET_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          uv run flet build apk --yes -vv 2>&1 | tee build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Show build failure details
+        if: failure()
+        run: |
+          echo "=== Last 120 lines of build.log ==="
+          tail -n 120 build.log 2>/dev/null || echo "No build.log found"
+          echo "=== Gradle errors (if any) ==="
+          grep -R "FAILURE\|error:\|Error:\|Exception" build 2>/dev/null | tail -n 40 || true
+          echo "=== build/ contents ==="
+          find build -type f 2>/dev/null || echo "No build/ directory"
+
+      - name: Remove keystore from runner
+        if: always()
+        run: rm -f "$KEYSTORE_PATH"
+
+      - name: Show build output
+        if: always()
+        run: |
+          find build -type f 2>/dev/null || echo "No build/ directory"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: picker-check-apk
+          path: build/apk/
+          if-no-files-found: error

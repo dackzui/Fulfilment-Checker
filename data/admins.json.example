@@ -1,0 +1,10 @@
+{
+  "admins": [
+    {
+      "username": "admin",
+      "role": "super_admin",
+      "salt": "replace-with-generated-salt",
+      "password_hash": "replace-with-generated-hash"
+    }
+  ]
+}
