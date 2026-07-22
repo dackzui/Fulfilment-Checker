@@ -658,8 +658,10 @@ def build(
             picked: bool,
             color: str | None = None,
             weight: ft.FontWeight | None = None,
+            strikethrough: bool | None = None,
         ) -> ft.Container:
             text_color = color or (TEXT_MUTED if picked else TEXT)
+            apply_strike = picked if strikethrough is None else strikethrough
             return ft.Container(
                 expand=True,
                 alignment=ft.Alignment.CENTER,
@@ -673,7 +675,7 @@ def build(
                     style=ft.TextStyle(
                         decoration=(
                             ft.TextDecoration.LINE_THROUGH
-                            if picked
+                            if apply_strike
                             else ft.TextDecoration.NONE
                         ),
                     ),
@@ -695,12 +697,17 @@ def build(
                             _short_label(item.part_no, 18),
                             picked=picked,
                         ),
-                        _ordered_cell(str(item.qty_ordered), picked=picked),
+                        _ordered_cell(
+                            str(item.qty_ordered),
+                            picked=picked,
+                            strikethrough=False,
+                        ),
                         _ordered_cell(
                             str(item.qty_scanned),
                             picked=picked,
                             color="#43A047" if item.is_complete else DANGER,
                             weight=ft.FontWeight.BOLD,
+                            strikethrough=False,
                         ),
                         ft.Container(
                             expand=True,
