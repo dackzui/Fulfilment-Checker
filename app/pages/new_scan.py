@@ -31,7 +31,7 @@ from app.pdf_parser import (
     ticket_from_dict,
     total_qty_ordered_for_part,
 )
-from app.theme import BG_MAIN, BG_TABLE, BORDER, FONT_FAMILY, MIN_TOUCH, PRIMARY, TEXT, TEXT_MUTED
+from app.theme import BG_MAIN, BG_TABLE, BORDER, DANGER, FONT_FAMILY, MIN_TOUCH, PRIMARY, TEXT, TEXT_MUTED
 from app.verification import compute_verification
 
 _SCAN_KEY_CHARS = {
@@ -652,7 +652,14 @@ def build(
             )
             return
 
-        def _ordered_cell(value: str, *, picked: bool) -> ft.Container:
+        def _ordered_cell(
+            value: str,
+            *,
+            picked: bool,
+            color: str | None = None,
+            weight: ft.FontWeight | None = None,
+        ) -> ft.Container:
+            text_color = color or (TEXT_MUTED if picked else TEXT)
             return ft.Container(
                 expand=True,
                 alignment=ft.Alignment.CENTER,
@@ -661,7 +668,8 @@ def build(
                     size=12,
                     font_family=FONT_FAMILY,
                     text_align=ft.TextAlign.CENTER,
-                    color=TEXT_MUTED if picked else TEXT,
+                    color=text_color,
+                    weight=weight,
                     style=ft.TextStyle(
                         decoration=(
                             ft.TextDecoration.LINE_THROUGH
@@ -672,14 +680,14 @@ def build(
                 ),
             )
 
-        def _make_ordered_row(item: PickingTicketItem) -> ft.Container:
+        def _make_ordered_row(item: PickingTicketItem, index: int) -> ft.Container:
             picked = bool(item.picked)
             return ft.Container(
                 padding=ft.Padding.symmetric(horizontal=6, vertical=8),
                 border=ft.Border(bottom=ft.BorderSide(1, BORDER)),
                 bgcolor="#E8F5E9" if picked else None,
                 ink=True,
-                on_click=lambda _, part=item.part_no: toggle_item_picked(part),
+                on_click=lambda _, idx=index: toggle_item_picked(idx),
                 content=ft.Row(
                     [
                         _ordered_cell(item.pick_bay or "—", picked=picked),
@@ -688,7 +696,12 @@ def build(
                             picked=picked,
                         ),
                         _ordered_cell(str(item.qty_ordered), picked=picked),
-                        _ordered_cell(str(item.qty_scanned), picked=picked),
+                        _ordered_cell(
+                            str(item.qty_scanned),
+                            picked=picked,
+                            color="#43A047" if item.is_complete else DANGER,
+                            weight=ft.FontWeight.BOLD,
+                        ),
                         ft.Container(
                             expand=True,
                             alignment=ft.Alignment.CENTER,
@@ -702,7 +715,8 @@ def build(
             )
 
         ordered_list.controls = [
-            _make_ordered_row(item) for item in picking_ticket.items
+            _make_ordered_row(item, index)
+            for index, item in enumerate(picking_ticket.items)
         ]
         ordered_list_area.content = ft.Column(
             [
@@ -718,12 +732,12 @@ def build(
         )
         page.update()
 
-    def toggle_item_picked(part_no: str):
+    def toggle_item_picked(index: int):
         if not picking_ticket:
             return
-        ticket_item = find_ticket_item(picking_ticket.items, part_no)
-        if not ticket_item:
+        if index < 0 or index >= len(picking_ticket.items):
             return
+        ticket_item = picking_ticket.items[index]
         ticket_item.picked = not ticket_item.picked
         refresh_expected_table()
 
