@@ -16,16 +16,14 @@ ORDER_DATE_RE = re.compile(r"Order Date\s*:\s*(.+)", re.IGNORECASE)
 SHIP_DATE_RE = re.compile(r"Ship Date\s*:\s*(.+)", re.IGNORECASE)
 ADDRESS_SPLIT_X = 185
 JOINED_ITEM_RE = re.compile(
-    # Layout lines: PICK <Part #> <Description> EA <Ordered> <Committed> <B/O>
-    # Bin is on following line(s), not on this line.
-    r"^(?:PICK\d+\s+|PICK\s+)(?P<part_no>[A-Z0-9\-/]+)\s+(?P<description>.+?)\s+"
+    # Layout: PICK[bay_prefix] <Part #> <Description> EA <Ordered> <Committed> <B/O>
+    # Bay may start glued to PICK (PICK13) and finish on the next line (09 -> 1309).
+    r"^PICK(?P<bay_prefix>\d*)\s+(?P<part_no>[A-Z0-9\-/]+)\s+(?P<description>.+?)\s+"
     r"EA\s+(?P<qty_ordered>\d+)\s+(?P<qty>\d+)\s+(?P<qty_bo>\d+)\s*$",
     re.IGNORECASE,
 )
 ITEM_LINE_RE = re.compile(
-    # Layout lines are: PICK <Part #> <Description> EA <Ordered> <Committed> <B/O>
-    # Bin sits on the following line(s) in the Bin column — not after PICK.
-    r"^(?:PICK\d+\s+|PICK\s+)(\S+)\s+(.+?)\s+EA\s+\d+\s+(\d+)\s+\d+\s*$",
+    r"^PICK(?P<bay_prefix>\d*)\s+(\S+)\s+(.+?)\s+EA\s+\d+\s+(\d+)\s+\d+\s*$",
     re.IGNORECASE,
 )
 # Leading bin fragment on a follow-on line, optionally with description text after it.
@@ -233,7 +231,12 @@ def _append_continuation(description: str, line: str) -> str:
 
 
 def _merge_bin_fragments(fragments: list[str]) -> str:
-    """Join wrapped bin fragments (e.g. '433,44' + '4' -> '433,444')."""
+    """Join wrapped bin fragments.
+
+    Examples:
+      '433,44' + '4' -> '433,444'
+      '13' + '09' -> '1309'  (PICK13 + following '09')
+    """
     if not fragments:
         return ""
     merged = fragments[0].strip()
@@ -241,12 +244,24 @@ def _merge_bin_fragments(fragments: list[str]) -> str:
         piece = fragment.strip()
         if not piece:
             continue
+        # Complete a comma-wrapped segment: '433,44' + '4' -> '433,444'
         if "," in merged and len(merged.rsplit(",", 1)[-1]) < 3 and piece.isdigit():
             merged += piece
-        elif merged.endswith(",") or piece.startswith(","):
+            continue
+        # Complete a short wrapped bay without comma: '13' + '09' -> '1309'
+        merged_digits = merged.replace(",", "")
+        if (
+            merged_digits.isdigit()
+            and piece.isdigit()
+            and len(merged_digits) < 4
+            and len(merged_digits) + len(piece) <= 4
+        ):
+            merged += piece
+            continue
+        if merged.endswith(",") or piece.startswith(","):
             merged = merged.rstrip(",") + "," + piece.lstrip(",")
-        else:
-            merged = f"{merged},{piece}" if merged else piece
+            continue
+        merged = f"{merged},{piece}" if merged else piece
     return merged
 
 
@@ -254,6 +269,8 @@ def _consume_item_follow_lines(
     lines: list[str],
     start_index: int,
     description: str,
+    *,
+    bay_prefix: str = "",
 ) -> tuple[str, str, int]:
     """Read bin + description continuations after a PICK/EA item line.
 
@@ -261,6 +278,8 @@ def _consume_item_follow_lines(
     """
     index = start_index
     bin_fragments: list[str] = []
+    if (bay_prefix or "").strip():
+        bin_fragments.append(bay_prefix.strip())
 
     while index < len(lines):
         next_line = lines[index].strip()
@@ -315,10 +334,16 @@ def parse_picking_ticket(
             index += 1
             continue
 
-        part_no, description, qty_text = match.groups()
+        bay_prefix = (match.group("bay_prefix") or "").strip()
+        part_no = match.group(2)
+        description = match.group(3)
+        qty_text = match.group(4)
         index += 1
         pick_bay, description, index = _consume_item_follow_lines(
-            lines, index, description.strip()
+            lines,
+            index,
+            description.strip(),
+            bay_prefix=bay_prefix,
         )
 
         items.append(

@@ -263,9 +263,15 @@ def _extract_joined_entries(lines: list[str]) -> list[PickEntry]:
         if not match:
             index += 1
             continue
-        part_number, _description, qty = match.groups()
+        bay_prefix = (match.group("bay_prefix") or "").strip()
+        part_number = match.group(2)
+        _description = match.group(3)
+        qty = match.group(4)
         pick_bay, _description, index = _consume_item_follow_lines(
-            lines, index + 1, _description
+            lines,
+            index + 1,
+            _description,
+            bay_prefix=bay_prefix,
         )
         if part_number and pick_bay:
             entries.append(
