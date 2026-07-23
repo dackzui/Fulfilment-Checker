@@ -120,8 +120,14 @@ jobs:
           FLET_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -o pipefail
+          # Patch AndroidManifest during generation so UrlLauncher can open https links.
+          uv run python scripts/patch_android_url_queries.py 900 &
+          PATCH_PID=$!
           uv run flet build apk --yes -vv 2>&1 | tee build.log
-          exit ${PIPESTATUS[0]}
+          BUILD_STATUS=${PIPESTATUS[0]}
+          kill "$PATCH_PID" 2>/dev/null || true
+          wait "$PATCH_PID" 2>/dev/null || true
+          exit $BUILD_STATUS
 
       - name: Show build failure details
         if: failure()

@@ -142,25 +142,37 @@ class ScannerApp:
         def on_result(info: UpdateInfo | None):
             if not info:
                 return
+
+            def show_banner():
+                try:
+                    self._show_update_banner(info)
+                except Exception:
+                    pass
+
             try:
-                self._show_update_banner(info)
+                self.page.run_thread(show_banner)
             except Exception:
-                pass
+                show_banner()
 
         check_for_update_async(on_result)
 
     def _show_update_banner(self, info: UpdateInfo) -> None:
+        release_url = (info.release_url or GITHUB_REPO_URL).strip()
+        # Prefer the releases landing page so tablets can download the APK.
+        open_url = (
+            f"{GITHUB_REPO_URL}/releases/tag/v{info.latest_version}"
+            if info.latest_version
+            else release_url
+        )
+
         def on_dismiss(_=None):
             dismiss_update(info.latest_version)
             self.update_banner.visible = False
             self.update_banner.content = None
             self.page.update()
 
-        def on_open(_=None):
-            self.page.run_task(
-                self._open_release_url,
-                info.release_url or GITHUB_REPO_URL,
-            )
+        async def on_open(_=None):
+            await self._open_release_url(open_url)
 
         self.update_banner.content = ft.Container(
             bgcolor="#FFF8E1",
@@ -177,9 +189,9 @@ class ScannerApp:
                         font_family=FONT_FAMILY,
                         expand=True,
                     ),
-                    ft.TextButton(
+                    ft.FilledButton(
                         "View update",
-                        style=ft.ButtonStyle(color=PRIMARY),
+                        style=ft.ButtonStyle(bgcolor=PRIMARY, color=ft.Colors.WHITE),
                         on_click=on_open,
                     ),
                     ft.IconButton(
@@ -197,22 +209,119 @@ class ScannerApp:
         self.page.update()
 
     async def _open_release_url(self, url: str) -> None:
-        """Open the GitHub release page in the system browser."""
+        """Open the GitHub release page (in-app browser first, then system browser)."""
         target = (url or GITHUB_REPO_URL).strip()
-        try:
-            await self.url_launcher.launch_url(
-                target,
-                mode=ft.LaunchMode.EXTERNAL_APPLICATION,
-            )
+        opened = await self._try_launch_url(target)
+        if opened:
             return
-        except Exception:
-            pass
+        # Always give the user a tappable/copyable link if launch fails.
+        self._show_update_link_dialog(target)
+
+    async def _try_launch_url(self, target: str) -> bool:
+        # In-app web view works on Android without package-visibility <queries>.
+        # External browser needs those queries (patched into the APK at build time).
+        modes = [
+            ft.LaunchMode.IN_APP_WEB_VIEW,
+            ft.LaunchMode.IN_APP_BROWSER_VIEW,
+            ft.LaunchMode.EXTERNAL_APPLICATION,
+            ft.LaunchMode.PLATFORM_DEFAULT,
+        ]
+        launcher = self.url_launcher
+        for mode in modes:
+            try:
+                # Capture the Flutter plugin return value (False = failed to open).
+                result = await launcher._invoke_method(
+                    "launch_url",
+                    {
+                        "url": target,
+                        "mode": mode,
+                        "web_view_configuration": None,
+                        "browser_configuration": None,
+                        "web_only_window_name": None,
+                    },
+                )
+                if result is False:
+                    continue
+                return True
+            except Exception:
+                continue
+
+        # Desktop fallback
         try:
             import webbrowser
 
-            webbrowser.open(target)
+            if webbrowser.open(target):
+                return True
         except Exception:
-            self.show_snack(f"Open this link: {target}", error=True)
+            pass
+
+        try:
+            import os
+            import subprocess
+            import sys
+
+            if sys.platform.startswith("win"):
+                os.startfile(target)  # type: ignore[attr-defined]
+                return True
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", target])
+                return True
+            subprocess.Popen(["xdg-open", target])
+            return True
+        except Exception:
+            return False
+
+    def _show_update_link_dialog(self, url: str) -> None:
+        async def retry_open(_=None):
+            opened = await self._try_launch_url(url)
+            if opened:
+                self.page.pop_dialog()
+            else:
+                self.show_snack(
+                    "Could not open browser. Long-press the link to copy it.",
+                    error=True,
+                )
+
+        link = ft.Text(
+            spans=[
+                ft.TextSpan(
+                    url,
+                    style=ft.TextStyle(
+                        color=PRIMARY,
+                        decoration=ft.TextDecoration.UNDERLINE,
+                        size=13,
+                    ),
+                    url=url,
+                    on_click=retry_open,
+                )
+            ],
+            selectable=True,
+            font_family=FONT_FAMILY,
+        )
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Download update", font_family=FONT_FAMILY),
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Open this page in your browser to download the latest APK:",
+                            font_family=FONT_FAMILY,
+                            size=13,
+                        ),
+                        link,
+                    ],
+                    tight=True,
+                    spacing=12,
+                    width=420,
+                ),
+                actions=[
+                    ft.TextButton("Close", on_click=lambda _: self.page.pop_dialog()),
+                    ft.TextButton("Open page", on_click=retry_open),
+                ],
+            )
+        )
 
     def navigate(
         self,
