@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import flet as ft
@@ -94,22 +94,39 @@ def _date_filter_row(
 ) -> tuple[ft.TextField, ft.Row]:
     field = text_input(hint="dd/mm/yyyy", value=value, read_only=True, expand=True)
 
+    def _end_of_today() -> datetime:
+        return datetime.combine(date.today(), datetime.max.time())
+
     picker = ft.DatePicker(
-        help_text="Select date",
+        help_text="Select date (today allowed)",
         entry_mode=ft.DatePickerEntryMode.CALENDAR,
         locale=ft.Locale("en", "AU"),
+        first_date=date(2020, 1, 1),
+        last_date=_end_of_today(),
+        current_date=date.today(),
     )
 
     def open_picker(_=None):
+        # Keep last_date at end of today so the current day stays selectable.
+        picker.last_date = _end_of_today()
+        picker.current_date = date.today()
         parsed = _parse_display_date(field.value or "")
-        picker.value = (
-            datetime.combine(parsed, datetime.min.time()) if parsed else datetime.now()
+        if parsed and parsed > date.today():
+            parsed = date.today()
+        picker.value = datetime.combine(
+            parsed or date.today(),
+            datetime.min.time(),
         )
         page.show_dialog(picker)
 
     def on_date_selected(_):
         if picker.value:
-            field.value = _format_filter_date(picker.value)
+            selected = picker.value
+            if isinstance(selected, datetime):
+                selected = selected.date()
+            if selected > date.today():
+                selected = date.today()
+            field.value = _format_filter_date(selected)
         page.pop_dialog()
         field.update()
 

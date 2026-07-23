@@ -52,7 +52,9 @@ class ScannerApp:
             self.admin_role = stored_role
 
         self.file_picker = ft.FilePicker()
+        self.url_launcher = ft.UrlLauncher()
         page.services.append(self.file_picker)
+        page.services.append(self.url_launcher)
 
         self.page_body = ft.Container(expand=True)
         self.update_banner = ft.Container(visible=False)
@@ -155,7 +157,10 @@ class ScannerApp:
             self.page.update()
 
         def on_open(_=None):
-            self.page.launch_url(info.release_url or GITHUB_REPO_URL)
+            self.page.run_task(
+                self._open_release_url,
+                info.release_url or GITHUB_REPO_URL,
+            )
 
         self.update_banner.content = ft.Container(
             bgcolor="#FFF8E1",
@@ -190,6 +195,24 @@ class ScannerApp:
         )
         self.update_banner.visible = True
         self.page.update()
+
+    async def _open_release_url(self, url: str) -> None:
+        """Open the GitHub release page in the system browser."""
+        target = (url or GITHUB_REPO_URL).strip()
+        try:
+            await self.url_launcher.launch_url(
+                target,
+                mode=ft.LaunchMode.EXTERNAL_APPLICATION,
+            )
+            return
+        except Exception:
+            pass
+        try:
+            import webbrowser
+
+            webbrowser.open(target)
+        except Exception:
+            self.show_snack(f"Open this link: {target}", error=True)
 
     def navigate(
         self,
