@@ -16,14 +16,20 @@ ORDER_DATE_RE = re.compile(r"Order Date\s*:\s*(.+)", re.IGNORECASE)
 SHIP_DATE_RE = re.compile(r"Ship Date\s*:\s*(.+)", re.IGNORECASE)
 ADDRESS_SPLIT_X = 185
 JOINED_ITEM_RE = re.compile(
-    r"^(?:PICK\s+(?P<pick_bay>\S+)\s+|PICK(?P<pick_bay2>\d+)\s+)"
-    r"(?P<part_no>[A-Z0-9\-/]+)\s+(?P<description>.+?)\s+EA\s+(?P<qty>\d+)\s+\d+\s+\d+\s*$",
+    # Layout lines: PICK <Part #> <Description> EA <Ordered> <Committed> <B/O>
+    # Bin is on following line(s), not on this line.
+    r"^(?:PICK\d+\s+|PICK\s+)(?P<part_no>[A-Z0-9\-/]+)\s+(?P<description>.+?)\s+"
+    r"EA\s+(?P<qty_ordered>\d+)\s+(?P<qty>\d+)\s+(?P<qty_bo>\d+)\s*$",
     re.IGNORECASE,
 )
 ITEM_LINE_RE = re.compile(
-    r"^(?:PICK\d+\s+|PICK\s+)(\S+)\s+(.+?)\s+EA\s+(\d+)\s+\d+\s+\d+\s*$",
+    # Layout lines are: PICK <Part #> <Description> EA <Ordered> <Committed> <B/O>
+    # Bin sits on the following line(s) in the Bin column — not after PICK.
+    r"^(?:PICK\d+\s+|PICK\s+)(\S+)\s+(.+?)\s+EA\s+\d+\s+(\d+)\s+\d+\s*$",
     re.IGNORECASE,
 )
+# Leading bin fragment on a follow-on line, optionally with description text after it.
+BIN_FOLLOW_RE = re.compile(r"^([\d,]+)(?:\s+(.*))?$")
 SKIP_LINE_RE = re.compile(
     r"^(PICKING NOTES:|Customer|Order Date|Order Number|Ship Date|\d+ of \d+)",
     re.IGNORECASE,
@@ -34,6 +40,8 @@ SKIP_LINE_RE = re.compile(
 class PickingTicketItem:
     part_no: str
     description: str
+    # Expected pick qty = Qty Committed from the ticket (not Qty Ordered).
+    # Back-order tickets can be re-picked later when more is committed.
     qty_ordered: int
     qty_scanned: int = 0
     pick_bay: str = ""
@@ -224,6 +232,63 @@ def _append_continuation(description: str, line: str) -> str:
     return f"{description} {extra}".strip()
 
 
+def _merge_bin_fragments(fragments: list[str]) -> str:
+    """Join wrapped bin fragments (e.g. '433,44' + '4' -> '433,444')."""
+    if not fragments:
+        return ""
+    merged = fragments[0].strip()
+    for fragment in fragments[1:]:
+        piece = fragment.strip()
+        if not piece:
+            continue
+        if "," in merged and len(merged.rsplit(",", 1)[-1]) < 3 and piece.isdigit():
+            merged += piece
+        elif merged.endswith(",") or piece.startswith(","):
+            merged = merged.rstrip(",") + "," + piece.lstrip(",")
+        else:
+            merged = f"{merged},{piece}" if merged else piece
+    return merged
+
+
+def _consume_item_follow_lines(
+    lines: list[str],
+    start_index: int,
+    description: str,
+) -> tuple[str, str, int]:
+    """Read bin + description continuations after a PICK/EA item line.
+
+    Returns (pick_bay, description, next_index).
+    """
+    index = start_index
+    bin_fragments: list[str] = []
+
+    while index < len(lines):
+        next_line = lines[index].strip()
+        if not next_line:
+            index += 1
+            continue
+        if _looks_like_item_line(next_line) or SKIP_LINE_RE.match(next_line):
+            break
+
+        bin_match = BIN_FOLLOW_RE.match(next_line)
+        if bin_match:
+            bin_fragments.append(bin_match.group(1))
+            extra = (bin_match.group(2) or "").strip()
+            if extra and _is_description_continuation(extra):
+                description = _append_continuation(description, extra)
+            index += 1
+            continue
+
+        if _is_description_continuation(next_line):
+            description = _append_continuation(description, next_line)
+            index += 1
+            continue
+
+        break
+
+    return _merge_bin_fragments(bin_fragments), description, index
+
+
 def parse_picking_ticket(
     source: str | Path | bytes | BinaryIO,
     *,
@@ -252,19 +317,16 @@ def parse_picking_ticket(
 
         part_no, description, qty_text = match.groups()
         index += 1
-        while index < len(lines):
-            next_line = lines[index].strip()
-            if _looks_like_item_line(next_line) or SKIP_LINE_RE.match(next_line):
-                break
-            if _is_description_continuation(next_line):
-                description = _append_continuation(description, next_line)
-            index += 1
+        pick_bay, description, index = _consume_item_follow_lines(
+            lines, index, description.strip()
+        )
 
         items.append(
             PickingTicketItem(
                 part_no=part_no.strip(),
                 description=description.strip(),
-                qty_ordered=int(qty_text),
+                qty_ordered=int(qty_text),  # Qty Committed
+                pick_bay=pick_bay,
             )
         )
 

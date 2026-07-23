@@ -13,7 +13,7 @@ from typing import Any, BinaryIO, Literal
 from fpdf import FPDF
 
 from app.pick_orders import CUSTOM_PICK_ORDER, CUSTOM_PICK_ORDER_2
-from app.pdf_parser import JOINED_ITEM_RE, ORDER_RE, _layout_lines, _pdf_bytes
+from app.pdf_parser import ORDER_RE, _layout_lines, _pdf_bytes
 
 SortMethod = Literal["ascending", "model_i", "model_ii"]
 
@@ -253,21 +253,26 @@ def _extract_ea_entries(lines: list[str]) -> list[PickEntry]:
 
 
 def _extract_joined_entries(lines: list[str]) -> list[PickEntry]:
-    """Single-line ticket rows (pdfminer layout used by New Scan)."""
+    """pdfminer layout rows: PICK <Part #> <Desc> EA ... with Bin on following lines."""
+    from app.pdf_parser import ITEM_LINE_RE, _consume_item_follow_lines
+
     entries: list[PickEntry] = []
-    for line in lines:
-        match = JOINED_ITEM_RE.match(line.strip())
+    index = 0
+    while index < len(lines):
+        match = ITEM_LINE_RE.match(lines[index].strip())
         if not match:
+            index += 1
             continue
-        pick_bay = (match.group("pick_bay") or match.group("pick_bay2") or "").strip()
-        part_number = (match.group("part_no") or "").strip()
-        qty = (match.group("qty") or "").strip()
-        if pick_bay and part_number:
+        part_number, _description, qty = match.groups()
+        pick_bay, _description, index = _consume_item_follow_lines(
+            lines, index + 1, _description
+        )
+        if part_number and pick_bay:
             entries.append(
                 PickEntry(
                     pick=_normalize_pick_bay(pick_bay),
-                    part_no=part_number,
-                    qty_committed=qty,
+                    part_no=part_number.strip(),
+                    qty_committed=qty.strip(),
                 )
             )
     return entries
@@ -356,18 +361,11 @@ def attach_pick_bays_to_ticket(
             if parts_match(item.part_no, entry.part_no):
                 item.pick_bay = entry.pick
                 break
-            # Ticket parser may have stored pick bay in the part_no column.
-            if parts_match(item.part_no, entry.pick):
-                item.pick_bay = entry.pick
-                item.part_no = entry.part_no
-                break
 
     if entries:
         def item_order(item) -> tuple[float, int]:
             for index, entry in enumerate(entries):
                 if parts_match(item.part_no, entry.part_no):
-                    return (_pick_sort_rank(entry.pick, method), index)
-                if parts_match(item.part_no, entry.pick):
                     return (_pick_sort_rank(entry.pick, method), index)
             return (_pick_sort_rank(item.pick_bay, method), 999999)
 
