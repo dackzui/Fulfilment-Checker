@@ -116,18 +116,69 @@ def get_sync_folder() -> Path | None:
     return path if path.exists() and path.is_dir() else None
 
 
+def folder_pick_error_message(path: Path | str | None) -> str:
+    """Explain why a picked folder cannot be used (common on Android)."""
+    raw = str(path or "").strip()
+    if not raw:
+        return "No folder was selected."
+    lower = raw.lower()
+    if lower.startswith("content://") or "com.google.android.apps.docs" in lower:
+        return (
+            "Android cannot use Google Drive / cloud folders from the picker "
+            "as a normal folder. On a tablet, use Sign in with Google Drive or "
+            "OneDrive below (after Super Admin enables them), or on a PC pick "
+            "the real OneDrive/Google Drive folder under your user profile."
+        )
+    if "onedrive" in lower and (":" not in raw[:3] and not raw.startswith("/storage")):
+        # content-style OneDrive picks often look unusual
+        pass
+    folder = Path(raw)
+    if not folder.exists():
+        return (
+            f"Folder not found: {folder}\n\n"
+            "On tablets, the system picker often returns a cloud shortcut that "
+            "is not a real folder. Prefer Sign in with OneDrive / Google Drive, "
+            "or on a PC choose something like:\n"
+            "  …\\OneDrive - Your Company\\…\n"
+            "  …\\Google Drive\\My Drive\\…"
+        )
+    if not folder.is_dir():
+        return f"Not a folder: {folder}"
+    return f"Folder not found: {folder}"
+
+
 def set_sync_folder(path: Path | str | None) -> Path | None:
     config = _load_app_config()
     if path is None or str(path).strip() == "":
         config.pop("cloud_sync_folder", None)
         _save_app_config(config)
         return None
-    folder = Path(path)
+    raw = str(path).strip()
+    lower = raw.lower()
+    if lower.startswith("content://") or "com.google.android.apps.docs" in lower:
+        raise FileNotFoundError(folder_pick_error_message(raw))
+    folder = Path(raw)
     if not folder.exists() or not folder.is_dir():
-        raise FileNotFoundError(f"Folder not found: {folder}")
-    config["cloud_sync_folder"] = str(folder)
+        raise FileNotFoundError(folder_pick_error_message(folder))
+    config["cloud_sync_folder"] = str(folder.resolve())
     _save_app_config(config)
     return folder
+
+
+def oauth_status_lines() -> list[str]:
+    """Short status strings for Settings."""
+    lines: list[str] = []
+    if oauth_available(PROVIDER_GOOGLE):
+        state = "signed in" if is_signed_in(PROVIDER_GOOGLE) else "ready — sign in"
+        lines.append(f"Google Drive: {state}")
+    else:
+        lines.append("Google Drive: not enabled (needs client ID + secret)")
+    if oauth_available(PROVIDER_ONEDRIVE):
+        state = "signed in" if is_signed_in(PROVIDER_ONEDRIVE) else "ready — sign in"
+        lines.append(f"OneDrive: {state}")
+    else:
+        lines.append("OneDrive: not enabled (needs Microsoft app client ID)")
+    return lines
 
 
 def tokens_dir() -> Path:

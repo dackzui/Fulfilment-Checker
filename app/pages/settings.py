@@ -468,29 +468,43 @@ def build(
 
     folder = cloud_sync.get_sync_folder()
     folder_label = muted(
-        str(folder) if folder else "No folder selected yet."
+        str(folder) if folder else "No local cloud folder selected yet."
     )
+    oauth_status_label = muted("\n".join(cloud_sync.oauth_status_lines()))
     clear_folder_btn = ft.OutlinedButton(
         "Clear folder",
         height=MIN_TOUCH,
         disabled=folder is None,
     )
+    path_field = ft.TextField(
+        label="Or paste a folder path (PC)",
+        value=str(folder) if folder else "",
+        hint_text=r"e.g. C:\Users\...\OneDrive - Company\Reports",
+        dense=True,
+        expand=True,
+    )
 
     def refresh_folder_ui():
         folder_now = cloud_sync.get_sync_folder()
         folder_label.value = (
-            str(folder_now) if folder_now else "No folder selected yet."
+            str(folder_now) if folder_now else "No local cloud folder selected yet."
         )
         clear_folder_btn.disabled = folder_now is None
+        path_field.value = str(folder_now) if folder_now else (path_field.value or "")
+        oauth_status_label.value = "\n".join(cloud_sync.oauth_status_lines())
         page.update()
 
     async def pick_sync_folder(_=None):
         if not is_admin:
             open_login_dialog()
             return
-        path = await file_picker.get_directory_path(
-            dialog_title="Choose Google Drive or OneDrive folder"
-        )
+        try:
+            path = await file_picker.get_directory_path(
+                dialog_title="Choose a local OneDrive or Google Drive folder"
+            )
+        except Exception as exc:
+            show_snack(f"Folder picker failed: {exc}", error=True)
+            return
         if not path:
             return
         try:
@@ -500,26 +514,220 @@ def build(
         except Exception as exc:
             show_snack(str(exc), error=True)
 
+    def save_path_field(_=None):
+        if not is_admin:
+            open_login_dialog()
+            return
+        typed = (path_field.value or "").strip()
+        if not typed:
+            show_snack("Enter a folder path first.", error=True)
+            return
+        try:
+            cloud_sync.set_sync_folder(typed)
+            refresh_folder_ui()
+            show_snack(f"Cloud folder set — {typed}")
+        except Exception as exc:
+            show_snack(str(exc), error=True)
+
     def clear_sync_folder(_=None):
         cloud_sync.set_sync_folder(None)
+        path_field.value = ""
         refresh_folder_ui()
         show_snack("Cloud folder cleared.")
 
     clear_folder_btn.on_click = clear_sync_folder
 
-    cloud_section = _card(
-        "Cloud Sync",
-        "For tablets and PCs: choose the Google Drive or OneDrive folder on this "
-        "device. History → Sync copies reports into a folder named "
-        f"'{cloud_sync.CLOUD_FOLDER_NAME} - <login user>' — no cloud login or API keys.",
+    def run_cloud_sign_in(provider: str):
+        if not is_admin:
+            open_login_dialog()
+            return
+        status = {"text": f"Signing in to {cloud_sync.PROVIDER_LABELS.get(provider, provider)}…"}
+        status_label = ft.Text(status["text"], size=13, font_family=FONT_FAMILY)
+
+        def close_dialog(_=None):
+            page.pop_dialog()
+
+        def do_sign_in():
+            try:
+                def on_progress(msg: str):
+                    status_label.value = msg
+                    page.update()
+
+                cloud_sync.sign_in(provider, on_progress=on_progress)
+                page.pop_dialog()
+                refresh_folder_ui()
+                show_snack(
+                    f"Signed in to {cloud_sync.PROVIDER_LABELS.get(provider, provider)}."
+                )
+            except Exception as exc:
+                status_label.value = str(exc)
+                page.update()
+                show_snack(str(exc), error=True)
+
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text(
+                    f"Sign in — {cloud_sync.PROVIDER_LABELS.get(provider, provider)}"
+                ),
+                content=ft.Column(
+                    [
+                        muted(
+                            "A browser or device-code prompt may open. "
+                            "Stay on this screen until sign-in finishes."
+                        ),
+                        status_label,
+                    ],
+                    tight=True,
+                    spacing=12,
+                    width=360,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=close_dialog),
+                    ft.TextButton(
+                        "Continue",
+                        on_click=lambda _: page.run_thread(do_sign_in),
+                    ),
+                ],
+            )
+        )
+
+    def sign_out_provider(provider: str):
+        cloud_sync.sign_out(provider)
+        refresh_folder_ui()
+        show_snack(f"Signed out of {cloud_sync.PROVIDER_LABELS.get(provider, provider)}.")
+
+    oauth_buttons: list[ft.Control] = []
+    if cloud_sync.oauth_available(cloud_sync.PROVIDER_GOOGLE):
+        if cloud_sync.is_signed_in(cloud_sync.PROVIDER_GOOGLE):
+            oauth_buttons.append(
+                ft.OutlinedButton(
+                    "Sign out of Google Drive",
+                    height=MIN_TOUCH,
+                    on_click=lambda _: sign_out_provider(cloud_sync.PROVIDER_GOOGLE),
+                )
+            )
+        else:
+            oauth_buttons.append(
+                ft.ElevatedButton(
+                    "Sign in with Google Drive",
+                    icon=ft.Icons.CLOUD,
+                    bgcolor=PRIMARY,
+                    color=ft.Colors.WHITE,
+                    height=MIN_TOUCH,
+                    on_click=lambda _: run_cloud_sign_in(cloud_sync.PROVIDER_GOOGLE),
+                )
+            )
+    if cloud_sync.oauth_available(cloud_sync.PROVIDER_ONEDRIVE):
+        if cloud_sync.is_signed_in(cloud_sync.PROVIDER_ONEDRIVE):
+            oauth_buttons.append(
+                ft.OutlinedButton(
+                    "Sign out of OneDrive",
+                    height=MIN_TOUCH,
+                    on_click=lambda _: sign_out_provider(cloud_sync.PROVIDER_ONEDRIVE),
+                )
+            )
+        else:
+            oauth_buttons.append(
+                ft.ElevatedButton(
+                    "Sign in with OneDrive",
+                    icon=ft.Icons.CLOUD_UPLOAD,
+                    bgcolor=PRIMARY,
+                    color=ft.Colors.WHITE,
+                    height=MIN_TOUCH,
+                    on_click=lambda _: run_cloud_sign_in(cloud_sync.PROVIDER_ONEDRIVE),
+                )
+            )
+
+    def open_oauth_setup_dialog(_=None):
+        if not is_super_admin:
+            show_snack("Only Super Admin can enable Google / OneDrive login.", error=True)
+            return
+        creds = cloud_sync.resolve_credentials()
+        g = creds.get("google") or {}
+        m = creds.get("microsoft") or {}
+        google_id = ft.TextField(
+            label="Google OAuth Client ID",
+            value=g.get("client_id") or "",
+            dense=True,
+        )
+        google_secret = ft.TextField(
+            label="Google OAuth Client Secret",
+            value=g.get("client_secret") or "",
+            password=True,
+            can_reveal_password=True,
+            dense=True,
+        )
+        ms_id = ft.TextField(
+            label="Microsoft (Azure) Application (client) ID",
+            value=m.get("client_id") or "",
+            dense=True,
+        )
+        ms_tenant = ft.TextField(
+            label="Microsoft tenant",
+            value=m.get("tenant") or "organizations",
+            hint_text="organizations (work) or consumers (personal)",
+            dense=True,
+        )
+
+        def close_dialog(_=None):
+            page.pop_dialog()
+
+        def save_creds(_=None):
+            try:
+                cloud_sync.save_credentials(
+                    google_client_id=google_id.value or "",
+                    google_client_secret=google_secret.value or "",
+                    microsoft_client_id=ms_id.value or "",
+                    microsoft_tenant=ms_tenant.value or "organizations",
+                )
+                page.pop_dialog()
+                show_snack("Cloud login settings saved. Re-open Settings to refresh buttons.")
+                navigate("settings")
+            except Exception as exc:
+                show_snack(str(exc), error=True)
+
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Enable Google / OneDrive login"),
+                content=ft.Column(
+                    [
+                        muted(
+                            "Register an app once in Google Cloud Console and Azure "
+                            "Portal, then paste the IDs here. Tablets need this — "
+                            "they cannot use the Google Drive folder picker."
+                        ),
+                        google_id,
+                        google_secret,
+                        ms_id,
+                        ms_tenant,
+                    ],
+                    tight=True,
+                    spacing=10,
+                    width=420,
+                    scroll=ft.ScrollMode.AUTO,
+                    height=360,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=close_dialog),
+                    ft.TextButton("Save", on_click=save_creds),
+                ],
+            )
+        )
+
+    cloud_controls: list[ft.Control] = [
+        muted(
+            "PC: pick your real OneDrive/Google Drive folder on disk "
+            "(e.g. OneDrive - DEKS Industries…). "
+            "Tablet: do not pick Google Drive from the Android picker — "
+            "that causes “Folder not found”. Use Sign in with OneDrive / "
+            "Google Drive instead (Super Admin enables this once)."
+        ),
         ft.Text(
-            "Cloud folder on this device",
+            "Option A — Local synced folder (best on PC)",
             weight=ft.FontWeight.W_600,
             font_family=FONT_FAMILY,
-        ),
-        muted(
-            "Install Google Drive or OneDrive on the tablet, then pick that "
-            "synced folder here. Files sync to the cloud through the Drive app."
         ),
         folder_label,
         ft.Row(
@@ -537,7 +745,51 @@ def build(
             spacing=12,
             wrap=True,
         ),
-        muted("Only signed-in Admin or Super Admin can change the folder."),
+        ft.Row(
+            [
+                path_field,
+                ft.OutlinedButton(
+                    "Use path",
+                    height=MIN_TOUCH,
+                    on_click=save_path_field,
+                ),
+            ],
+            spacing=8,
+        ),
+        ft.Divider(height=12, color=ft.Colors.TRANSPARENT),
+        ft.Text(
+            "Option B — Sign in (best on tablets)",
+            weight=ft.FontWeight.W_600,
+            font_family=FONT_FAMILY,
+        ),
+        oauth_status_label,
+    ]
+    if oauth_buttons:
+        cloud_controls.append(ft.Row(oauth_buttons, spacing=12, wrap=True))
+    else:
+        cloud_controls.append(
+            muted(
+                "Google Drive and OneDrive sign-in are not enabled yet. "
+                "Ask Super Admin to tap “Enable Google / OneDrive login”."
+            )
+        )
+    if is_super_admin:
+        cloud_controls.append(
+            ft.TextButton(
+                "Enable Google / OneDrive login…",
+                icon=ft.Icons.KEY,
+                on_click=open_oauth_setup_dialog,
+            )
+        )
+    cloud_controls.append(
+        muted("Only signed-in Admin or Super Admin can change cloud settings.")
+    )
+
+    cloud_section = _card(
+        "Cloud Sync",
+        "Send History reports to OneDrive or Google Drive. "
+        f"Files go under '{cloud_sync.CLOUD_FOLDER_NAME} - <login user>/History'.",
+        *cloud_controls,
     )
 
     return ft.Container(

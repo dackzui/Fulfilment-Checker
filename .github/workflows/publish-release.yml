@@ -9,9 +9,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)publish, e.g. v1.8.0"
+        description: "Existing tag to (re)publish, e.g. v1.8.0 or v1.8.9-pre"
         required: true
         type: string
+      prerelease:
+        description: "Mark GitHub Release as pre-release"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -41,9 +46,17 @@ jobs:
             *) TAG="v${TAG}" ;;
           esac
           VERSION="${TAG#v}"
+          IS_PRERELEASE=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.prerelease }}" = "true" ]; then
+            IS_PRERELEASE=true
+          fi
+          case "$VERSION" in
+            *-pre*|*-rc*|*-beta*|*-alpha*) IS_PRERELEASE=true ;;
+          esac
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Publishing $TAG (version $VERSION)"
+          echo "prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG (version $VERSION, prerelease=$IS_PRERELEASE)"
 
       - name: Checkout
         uses: actions/checkout@v5
@@ -154,13 +167,14 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: Picking Barcode Scanner v${{ steps.version.outputs.version }}
+          name: Picking Barcode Scanner v${{ steps.version.outputs.version }}${{ steps.version.outputs.prerelease == 'true' && ' (Pre-release)' || '' }}
           generate_release_notes: true
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           files: ${{ steps.apk.outputs.path }}
           fail_on_unmatched_files: true
           body: |
-            ## Picking Barcode Scanner v${{ steps.version.outputs.version }}
+            ## Picking Barcode Scanner v${{ steps.version.outputs.version }}${{ steps.version.outputs.prerelease == 'true' && ' (Pre-release)' || '' }}
 
-            A new version is available. Download the APK below and install it over your existing tablet app.
+            ${{ steps.version.outputs.prerelease == 'true' && 'This is a **pre-release** for testing. Do not roll out to all tablets until verified.' || 'A new version is available. Download the APK below and install it over your existing tablet app.' }}
 
             Repository: https://github.com/dackzui/Fulfilment-Checker
