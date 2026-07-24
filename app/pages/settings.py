@@ -466,9 +466,12 @@ def build(
 
     # --- Cloud sync -------------------------------------------------------------
 
+    from flet.utils.platform_utils import is_mobile
+
+    on_mobile = is_mobile()
     folder = cloud_sync.get_sync_folder()
     folder_label = muted(
-        str(folder) if folder else "No local cloud folder selected yet."
+        str(folder) if folder else "No sync folder selected yet."
     )
     oauth_status_label = muted("\n".join(cloud_sync.oauth_status_lines()))
     clear_folder_btn = ft.OutlinedButton(
@@ -482,21 +485,37 @@ def build(
         hint_text=r"e.g. C:\Users\...\OneDrive - Company\Reports",
         dense=True,
         expand=True,
+        visible=not on_mobile,
     )
 
     def refresh_folder_ui():
         folder_now = cloud_sync.get_sync_folder()
         folder_label.value = (
-            str(folder_now) if folder_now else "No local cloud folder selected yet."
+            str(folder_now) if folder_now else "No sync folder selected yet."
         )
         clear_folder_btn.disabled = folder_now is None
-        path_field.value = str(folder_now) if folder_now else (path_field.value or "")
+        if not on_mobile:
+            path_field.value = str(folder_now) if folder_now else (path_field.value or "")
         oauth_status_label.value = "\n".join(cloud_sync.oauth_status_lines())
         page.update()
+
+    def apply_sync_folder(path: str | Path, *, label: str = "") -> None:
+        cloud_sync.set_sync_folder(path)
+        refresh_folder_ui()
+        show_snack(
+            f"Sync folder set — {label or path}"
+            if label
+            else f"Sync folder set — {path}"
+        )
 
     async def pick_sync_folder(_=None):
         if not is_admin:
             open_login_dialog()
+            return
+        if on_mobile:
+            # Android Drive/OneDrive shortcuts are not real folders — offer
+            # writable local targets instead of the broken system picker.
+            await choose_mobile_sync_folder()
             return
         try:
             path = await file_picker.get_directory_path(
@@ -508,11 +527,77 @@ def build(
         if not path:
             return
         try:
-            cloud_sync.set_sync_folder(path)
-            refresh_folder_ui()
-            show_snack(f"Cloud folder set — {path}")
+            apply_sync_folder(path)
         except Exception as exc:
             show_snack(str(exc), error=True)
+
+    async def choose_mobile_sync_folder(_=None):
+        if not is_admin:
+            open_login_dialog()
+            return
+        try:
+            targets = await cloud_sync.resolve_mobile_sync_targets(page)
+        except Exception as exc:
+            show_snack(f"Could not list tablet folders: {exc}", error=True)
+            return
+        if not targets:
+            show_snack(
+                "No writable tablet folders found. Ask Super Admin to enable "
+                "OneDrive / Google Drive sign-in.",
+                error=True,
+            )
+            return
+
+        selected = {"value": str(targets[0][1])}
+
+        def close_dialog(_=None):
+            page.pop_dialog()
+
+        def confirm(_=None):
+            raw = selected["value"]
+            label = next((name for name, path in targets if str(path) == raw), "")
+            try:
+                page.pop_dialog()
+                apply_sync_folder(raw, label=label or raw)
+            except Exception as exc:
+                show_snack(str(exc), error=True)
+
+        radios = [
+            ft.Radio(value=str(path), label=f"{name}  →  {path}")
+            for name, path in targets
+        ]
+        group = ft.RadioGroup(
+            value=selected["value"],
+            content=ft.Column(radios, tight=True, spacing=8),
+            on_change=lambda e: selected.update(value=e.control.value),
+        )
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Choose tablet sync folder"),
+                content=ft.Column(
+                    [
+                        muted(
+                            "Android cannot open Google Drive / OneDrive from the "
+                            "folder picker. Choose a local folder below. History → "
+                            "Sync will copy reports there (e.g. Downloads / "
+                            f"{cloud_sync.CLOUD_FOLDER_NAME}). "
+                            "For direct cloud upload, use Sign in with OneDrive."
+                        ),
+                        group,
+                    ],
+                    tight=True,
+                    spacing=12,
+                    width=420,
+                    height=360,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=close_dialog),
+                    ft.TextButton("Use this folder", on_click=confirm),
+                ],
+            )
+        )
 
     def save_path_field(_=None):
         if not is_admin:
@@ -523,9 +608,7 @@ def build(
             show_snack("Enter a folder path first.", error=True)
             return
         try:
-            cloud_sync.set_sync_folder(typed)
-            refresh_folder_ui()
-            show_snack(f"Cloud folder set — {typed}")
+            apply_sync_folder(typed)
         except Exception as exc:
             show_snack(str(exc), error=True)
 
@@ -718,14 +801,18 @@ def build(
 
     cloud_controls: list[ft.Control] = [
         muted(
-            "PC: pick your real OneDrive/Google Drive folder on disk "
+            "Tablet: tap “Choose tablet folder” and pick Downloads (recommended). "
+            "Android cannot select Google Drive / OneDrive in the system picker. "
+            "PC: choose your real OneDrive folder on disk "
+            "(e.g. OneDrive - DEKS Industries…)."
+            if on_mobile
+            else "PC: pick your real OneDrive/Google Drive folder on disk "
             "(e.g. OneDrive - DEKS Industries…). "
-            "Tablet: do not pick Google Drive from the Android picker — "
-            "that causes “Folder not found”. Use Sign in with OneDrive / "
-            "Google Drive instead (Super Admin enables this once)."
+            "Tablet builds use a Downloads folder instead of the Drive picker."
         ),
         ft.Text(
-            "Option A — Local synced folder (best on PC)",
+            "Sync folder"
+            + (" (tablet)" if on_mobile else " (PC OneDrive / Drive folder)"),
             weight=ft.FontWeight.W_600,
             font_family=FONT_FAMILY,
         ),
@@ -733,7 +820,7 @@ def build(
         ft.Row(
             [
                 ft.ElevatedButton(
-                    "Choose cloud folder",
+                    "Choose tablet folder" if on_mobile else "Choose cloud folder",
                     icon=ft.Icons.FOLDER_OPEN if is_admin else ft.Icons.LOCK,
                     bgcolor=PRIMARY if is_admin else "#9E9E9E",
                     color=ft.Colors.WHITE,
@@ -745,32 +832,40 @@ def build(
             spacing=12,
             wrap=True,
         ),
-        ft.Row(
-            [
-                path_field,
-                ft.OutlinedButton(
-                    "Use path",
-                    height=MIN_TOUCH,
-                    on_click=save_path_field,
-                ),
-            ],
-            spacing=8,
-        ),
-        ft.Divider(height=12, color=ft.Colors.TRANSPARENT),
-        ft.Text(
-            "Option B — Sign in (best on tablets)",
-            weight=ft.FontWeight.W_600,
-            font_family=FONT_FAMILY,
-        ),
-        oauth_status_label,
     ]
+    if not on_mobile:
+        cloud_controls.append(
+            ft.Row(
+                [
+                    path_field,
+                    ft.OutlinedButton(
+                        "Use path",
+                        height=MIN_TOUCH,
+                        on_click=save_path_field,
+                    ),
+                ],
+                spacing=8,
+            )
+        )
+    cloud_controls.extend(
+        [
+            ft.Divider(height=12, color=ft.Colors.TRANSPARENT),
+            ft.Text(
+                "Direct cloud login (optional)",
+                weight=ft.FontWeight.W_600,
+                font_family=FONT_FAMILY,
+            ),
+            oauth_status_label,
+        ]
+    )
     if oauth_buttons:
         cloud_controls.append(ft.Row(oauth_buttons, spacing=12, wrap=True))
     else:
         cloud_controls.append(
             muted(
                 "Google Drive and OneDrive sign-in are not enabled yet. "
-                "Ask Super Admin to tap “Enable Google / OneDrive login”."
+                "Ask Super Admin to tap “Enable Google / OneDrive login”. "
+                "On tablets you can still sync to Downloads with the button above."
             )
         )
     if is_super_admin:
@@ -787,7 +882,7 @@ def build(
 
     cloud_section = _card(
         "Cloud Sync",
-        "Send History reports to OneDrive or Google Drive. "
+        "Send History reports to a sync folder or OneDrive/Google Drive. "
         f"Files go under '{cloud_sync.CLOUD_FOLDER_NAME} - <login user>/History'.",
         *cloud_controls,
     )
