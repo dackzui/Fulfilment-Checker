@@ -530,7 +530,7 @@ def build(
             show_snack(str(exc), error=True)
 
     async def browse_system_folder(_=None):
-        """Optional Android Files picker — local folders only, not Drive shortcuts."""
+        """PC/advanced only — Android Drive shortcuts are rejected."""
         if not is_admin:
             open_login_dialog()
             return
@@ -543,13 +543,20 @@ def build(
             return
         if not path:
             return
+        if cloud_sync.is_android_cloud_shortcut_path(path):
+            show_snack(
+                "Google Drive / OneDrive shortcuts cannot be used on tablet. "
+                "Choose Shared Downloads from the list instead.",
+                error=True,
+            )
+            await choose_mobile_sync_folder()
+            return
         try:
             apply_sync_folder(path)
-            show_snack(
-                "Folder set. Tip: pick Downloads or Documents — not Google Drive."
-            )
         except Exception as exc:
             show_snack(str(exc), error=True)
+            if on_mobile:
+                await choose_mobile_sync_folder()
 
     async def choose_mobile_sync_folder(_=None):
         if not is_admin:
@@ -568,7 +575,13 @@ def build(
             )
             return
 
-        selected = {"value": str(targets[0][1])}
+        # Prefer shared Downloads when available.
+        default = targets[0]
+        for name, path in targets:
+            if "shared downloads" in name.lower():
+                default = (name, path)
+                break
+        selected = {"value": str(default[1])}
 
         def close_dialog(_=None):
             page.pop_dialog()
@@ -582,9 +595,17 @@ def build(
             except Exception as exc:
                 show_snack(str(exc), error=True)
 
-        def browse(_=None):
-            page.pop_dialog()
-            page.run_task(browse_system_folder)
+        def use_shared_downloads(_=None):
+            name, path = default
+            for n, p in targets:
+                if "shared downloads" in n.lower():
+                    name, path = n, p
+                    break
+            try:
+                page.pop_dialog()
+                apply_sync_folder(path, label=name)
+            except Exception as exc:
+                show_snack(str(exc), error=True)
 
         radios = []
         for name, path in targets:
@@ -609,11 +630,9 @@ def build(
                 content=ft.Column(
                     [
                         muted(
-                            "On tablets this is different from PC: Android cannot "
-                            "select Google Drive / OneDrive as a normal folder. "
-                            "Prefer “Shared Downloads” so you can open files in the "
-                            "Files app. For direct cloud upload later, use Sign in "
-                            "with OneDrive."
+                            "Do not pick Google Drive or OneDrive — Android only "
+                            "gives a shortcut and Sync will fail. "
+                            "Use Shared Downloads (recommended) or App Downloads."
                         ),
                         group,
                     ],
@@ -625,7 +644,10 @@ def build(
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=close_dialog),
-                    ft.TextButton("Browse Files…", on_click=browse),
+                    ft.TextButton(
+                        "Use Shared Downloads",
+                        on_click=use_shared_downloads,
+                    ),
                     ft.TextButton("Use this folder", on_click=confirm),
                 ],
             )

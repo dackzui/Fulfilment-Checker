@@ -112,8 +112,37 @@ def get_sync_folder() -> Path | None:
     raw = (_load_app_config().get("cloud_sync_folder") or "").strip()
     if not raw:
         return None
+    if is_android_cloud_shortcut_path(raw):
+        # Clear bad tablet picks so Sync does not keep failing.
+        set_sync_folder(None)
+        return None
     path = Path(raw)
-    return path if path.exists() and path.is_dir() else None
+    if path.exists() and path.is_dir():
+        return path
+    # Stale / missing path — clear so Settings shows "not selected".
+    set_sync_folder(None)
+    return None
+
+
+def is_android_cloud_shortcut_path(path: Path | str | None) -> bool:
+    """True for SAF / Drive shortcuts Android returns instead of a real folder."""
+    raw = str(path or "").strip()
+    if not raw:
+        return False
+    lower = raw.lower().replace("\\", "/")
+    if lower.startswith("content://"):
+        return True
+    if "com.google.android.apps.docs" in lower:
+        return True
+    if "com.microsoft.skydrive" in lower or "onedrive" in lower and "doc=encoded" in lower:
+        return True
+    # file_picker often maps tree URIs to fake paths like:
+    # /storage/emulated/0/acc=4;doc=encoded=...
+    if "acc=" in lower or "doc=encoded" in lower or ";doc=" in lower:
+        return True
+    if "tree/" in lower and "primary:" in lower:
+        return True
+    return False
 
 
 def folder_pick_error_message(path: Path | str | None) -> str:
@@ -121,26 +150,21 @@ def folder_pick_error_message(path: Path | str | None) -> str:
     raw = str(path or "").strip()
     if not raw:
         return "No folder was selected."
-    lower = raw.lower()
-    if lower.startswith("content://") or "com.google.android.apps.docs" in lower:
+    if is_android_cloud_shortcut_path(raw):
         return (
-            "Android cannot use Google Drive / cloud folders from the picker "
-            "as a normal folder. On a tablet, use Sign in with Google Drive or "
-            "OneDrive below (after Super Admin enables them), or on a PC pick "
-            "the real OneDrive/Google Drive folder under your user profile."
+            "That choice is a Google Drive / OneDrive shortcut, not a real folder "
+            "on the tablet.\n\n"
+            "On the tablet dialog, choose “Shared Downloads” (or App Downloads), "
+            "then tap Use this folder.\n"
+            "Do not pick Google Drive or OneDrive in Browse Files.\n\n"
+            "Direct cloud upload needs Super Admin to enable Sign in with OneDrive."
         )
-    if "onedrive" in lower and (":" not in raw[:3] and not raw.startswith("/storage")):
-        # content-style OneDrive picks often look unusual
-        pass
     folder = Path(raw)
     if not folder.exists():
         return (
             f"Folder not found: {folder}\n\n"
-            "On tablets, the system picker often returns a cloud shortcut that "
-            "is not a real folder. Prefer Sign in with OneDrive / Google Drive, "
-            "or on a PC choose something like:\n"
-            "  …\\OneDrive - Your Company\\…\n"
-            "  …\\Google Drive\\My Drive\\…"
+            "On tablets, choose Shared Downloads from the list — do not use "
+            "Browse Files to open Google Drive / OneDrive."
         )
     if not folder.is_dir():
         return f"Not a folder: {folder}"
@@ -154,12 +178,17 @@ def set_sync_folder(path: Path | str | None) -> Path | None:
         _save_app_config(config)
         return None
     raw = str(path).strip()
-    lower = raw.lower()
-    if lower.startswith("content://") or "com.google.android.apps.docs" in lower:
+    if is_android_cloud_shortcut_path(raw):
         raise FileNotFoundError(folder_pick_error_message(raw))
     folder = Path(raw)
     if not folder.exists() or not folder.is_dir():
         raise FileNotFoundError(folder_pick_error_message(folder))
+    # Require a writable folder so Sync today now does not fail later.
+    if not _folder_is_writable(folder):
+        raise FileNotFoundError(
+            f"Cannot write to folder: {folder}\n\n"
+            "Choose Shared Downloads or App Downloads from the tablet list."
+        )
     config["cloud_sync_folder"] = str(folder.resolve())
     _save_app_config(config)
     return folder
