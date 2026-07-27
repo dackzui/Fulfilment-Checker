@@ -513,7 +513,8 @@ def build(
             open_login_dialog()
             return
         if on_mobile:
-            await choose_mobile_sync_folder()
+            # Primary tablet flow: Android Files app directory picker.
+            await pick_from_android_files()
             return
         try:
             path = await file_picker.get_directory_path(
@@ -529,34 +530,33 @@ def build(
         except Exception as exc:
             show_snack(str(exc), error=True)
 
-    async def browse_system_folder(_=None):
-        """PC/advanced only — Android Drive shortcuts are rejected."""
+    async def pick_from_android_files(_=None):
+        """Open the system Files picker so the user chooses a local save folder."""
         if not is_admin:
             open_login_dialog()
             return
         try:
             path = await file_picker.get_directory_path(
-                dialog_title="Choose a local folder (not Google Drive / OneDrive)"
+                dialog_title=(
+                    "Choose save folder — Internal storage → Download "
+                    "(not Google Drive / OneDrive)"
+                ),
+                initial_directory="/storage/emulated/0/Download",
             )
         except Exception as exc:
-            show_snack(f"Folder picker failed: {exc}", error=True)
+            show_snack(f"Files picker failed: {exc}", error=True)
+            await choose_mobile_sync_folder()
             return
         if not path:
-            return
-        if cloud_sync.is_android_cloud_shortcut_path(path):
-            show_snack(
-                "Google Drive / OneDrive shortcuts cannot be used on tablet. "
-                "Choose Shared Downloads from the list instead.",
-                error=True,
-            )
+            # User cancelled — offer quick local fallbacks.
             await choose_mobile_sync_folder()
             return
         try:
             apply_sync_folder(path)
+            show_snack(f"Save folder set — {path}")
         except Exception as exc:
             show_snack(str(exc), error=True)
-            if on_mobile:
-                await choose_mobile_sync_folder()
+            await choose_mobile_sync_folder()
 
     async def choose_mobile_sync_folder(_=None):
         if not is_admin:
@@ -569,13 +569,12 @@ def build(
             return
         if not targets:
             show_snack(
-                "No writable tablet folders found. Ask Super Admin to enable "
-                "OneDrive / Google Drive sign-in.",
+                "No writable tablet folders found. Try again from Files: "
+                "Internal storage → Download.",
                 error=True,
             )
             return
 
-        # Prefer shared Downloads when available.
         default = targets[0]
         for name, path in targets:
             if "shared downloads" in name.lower():
@@ -595,17 +594,9 @@ def build(
             except Exception as exc:
                 show_snack(str(exc), error=True)
 
-        def use_shared_downloads(_=None):
-            name, path = default
-            for n, p in targets:
-                if "shared downloads" in n.lower():
-                    name, path = n, p
-                    break
-            try:
-                page.pop_dialog()
-                apply_sync_folder(path, label=name)
-            except Exception as exc:
-                show_snack(str(exc), error=True)
+        def open_files_again(_=None):
+            page.pop_dialog()
+            page.run_task(pick_from_android_files)
 
         radios = []
         for name, path in targets:
@@ -626,13 +617,14 @@ def build(
         page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title=ft.Text("Choose tablet sync folder"),
+                title=ft.Text("Or pick a quick local folder"),
                 content=ft.Column(
                     [
                         muted(
-                            "Do not pick Google Drive or OneDrive — Android only "
-                            "gives a shortcut and Sync will fail. "
-                            "Use Shared Downloads (recommended) or App Downloads."
+                            "Choose from Files is preferred. "
+                            "In Files: ☰ menu → Internal storage → Download or "
+                            "Documents. Do not select Google Drive / OneDrive.\n\n"
+                            "Or use a quick folder below:"
                         ),
                         group,
                     ],
@@ -644,10 +636,7 @@ def build(
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=close_dialog),
-                    ft.TextButton(
-                        "Use Shared Downloads",
-                        on_click=use_shared_downloads,
-                    ),
+                    ft.TextButton("Choose from Files…", on_click=open_files_again),
                     ft.TextButton("Use this folder", on_click=confirm),
                 ],
             )
@@ -855,18 +844,19 @@ def build(
 
     cloud_controls: list[ft.Control] = [
         muted(
-            "Tablet: tap “Choose tablet folder” and pick Downloads (recommended). "
-            "Android cannot select Google Drive / OneDrive in the system picker. "
+            "Tablet: tap “Choose from Files” and pick a folder under "
+            "Internal storage → Download or Documents. "
+            "Do not select Google Drive or OneDrive (Android blocks those). "
             "PC: choose your real OneDrive folder on disk "
             "(e.g. OneDrive - DEKS Industries…)."
             if on_mobile
             else "PC: pick your real OneDrive/Google Drive folder on disk "
             "(e.g. OneDrive - DEKS Industries…). "
-            "Tablet builds use a Downloads folder instead of the Drive picker."
+            "On tablets, use the Files app picker for Internal storage folders."
         ),
         ft.Text(
             "Sync folder"
-            + (" (tablet)" if on_mobile else " (PC OneDrive / Drive folder)"),
+            + (" (tablet — Files app)" if on_mobile else " (PC OneDrive / Drive folder)"),
             weight=ft.FontWeight.W_600,
             font_family=FONT_FAMILY,
         ),
@@ -874,7 +864,7 @@ def build(
         ft.Row(
             [
                 ft.ElevatedButton(
-                    "Choose tablet folder" if on_mobile else "Choose cloud folder",
+                    "Choose from Files" if on_mobile else "Choose cloud folder",
                     icon=ft.Icons.FOLDER_OPEN if is_admin else ft.Icons.LOCK,
                     bgcolor=PRIMARY if is_admin else "#9E9E9E",
                     color=ft.Colors.WHITE,

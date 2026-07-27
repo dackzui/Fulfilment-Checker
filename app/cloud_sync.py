@@ -125,24 +125,69 @@ def get_sync_folder() -> Path | None:
 
 
 def is_android_cloud_shortcut_path(path: Path | str | None) -> bool:
-    """True for SAF / Drive shortcuts Android returns instead of a real folder."""
+    """True for cloud SAF shortcuts Android returns instead of a real folder."""
     raw = str(path or "").strip()
     if not raw:
         return False
     lower = raw.lower().replace("\\", "/")
-    if lower.startswith("content://"):
+    if lower.startswith("content://") and "com.google.android.apps.docs" in lower:
+        return True
+    if lower.startswith("content://") and (
+        "skydrive" in lower or "onedrive" in lower or "microsoft" in lower
+    ):
         return True
     if "com.google.android.apps.docs" in lower:
         return True
-    if "com.microsoft.skydrive" in lower or "onedrive" in lower and "doc=encoded" in lower:
-        return True
-    # file_picker often maps tree URIs to fake paths like:
+    # file_picker often maps cloud tree URIs to fake paths like:
     # /storage/emulated/0/acc=4;doc=encoded=...
     if "acc=" in lower or "doc=encoded" in lower or ";doc=" in lower:
         return True
-    if "tree/" in lower and "primary:" in lower:
-        return True
     return False
+
+
+def normalize_picked_directory(path: Path | str | None) -> Path:
+    """Turn an Android Files / desktop picker result into a writable folder path."""
+    from urllib.parse import unquote
+
+    raw = str(path or "").strip()
+    if not raw:
+        raise FileNotFoundError(folder_pick_error_message(raw))
+    if is_android_cloud_shortcut_path(raw):
+        raise FileNotFoundError(folder_pick_error_message(raw))
+
+    candidates: list[Path] = []
+    decoded = unquote(raw)
+
+    # SAF "primary:Download" / "primary:Documents/Reports" → internal storage.
+    match = re.search(r"primary:([^\s;]+)", decoded, flags=re.IGNORECASE)
+    if match:
+        rel = unquote(match.group(1)).replace(":", "/")
+        candidates.append(Path("/storage/emulated/0") / rel)
+
+    # Plain filesystem path from the picker.
+    if not decoded.lower().startswith("content://"):
+        candidates.append(Path(decoded))
+    candidates.append(Path(raw))
+
+    # Common fallbacks if the picker returns a vague root.
+    lower = raw.lower().replace("\\", "/")
+    if lower.rstrip("/").endswith("/storage/emulated/0"):
+        candidates.extend(
+            [
+                Path("/storage/emulated/0/Download"),
+                Path("/storage/emulated/0/Downloads"),
+                Path("/storage/emulated/0/Documents"),
+            ]
+        )
+
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_dir() and _folder_is_writable(candidate):
+                return candidate.resolve()
+        except Exception:
+            continue
+
+    raise FileNotFoundError(folder_pick_error_message(raw))
 
 
 def folder_pick_error_message(path: Path | str | None) -> str:
@@ -152,23 +197,17 @@ def folder_pick_error_message(path: Path | str | None) -> str:
         return "No folder was selected."
     if is_android_cloud_shortcut_path(raw):
         return (
-            "That choice is a Google Drive / OneDrive shortcut, not a real folder "
-            "on the tablet.\n\n"
-            "On the tablet dialog, choose “Shared Downloads” (or App Downloads), "
-            "then tap Use this folder.\n"
-            "Do not pick Google Drive or OneDrive in Browse Files.\n\n"
-            "Direct cloud upload needs Super Admin to enable Sign in with OneDrive."
+            "Google Drive / OneDrive cannot be selected as a save folder on "
+            "Android.\n\n"
+            "In the Files picker open the menu (☰) → Internal storage → "
+            "Download or Documents, then tap Use this folder.\n"
+            "Do not open Google Drive or OneDrive from the side menu."
         )
-    folder = Path(raw)
-    if not folder.exists():
-        return (
-            f"Folder not found: {folder}\n\n"
-            "On tablets, choose Shared Downloads from the list — do not use "
-            "Browse Files to open Google Drive / OneDrive."
-        )
-    if not folder.is_dir():
-        return f"Not a folder: {folder}"
-    return f"Folder not found: {folder}"
+    return (
+        f"Could not use that folder:\n{raw}\n\n"
+        "In Files, choose Internal storage → Download or Documents "
+        "(a normal folder on this tablet), then tap Use this folder."
+    )
 
 
 def set_sync_folder(path: Path | str | None) -> Path | None:
@@ -177,19 +216,8 @@ def set_sync_folder(path: Path | str | None) -> Path | None:
         config.pop("cloud_sync_folder", None)
         _save_app_config(config)
         return None
-    raw = str(path).strip()
-    if is_android_cloud_shortcut_path(raw):
-        raise FileNotFoundError(folder_pick_error_message(raw))
-    folder = Path(raw)
-    if not folder.exists() or not folder.is_dir():
-        raise FileNotFoundError(folder_pick_error_message(folder))
-    # Require a writable folder so Sync today now does not fail later.
-    if not _folder_is_writable(folder):
-        raise FileNotFoundError(
-            f"Cannot write to folder: {folder}\n\n"
-            "Choose Shared Downloads or App Downloads from the tablet list."
-        )
-    config["cloud_sync_folder"] = str(folder.resolve())
+    folder = normalize_picked_directory(path)
+    config["cloud_sync_folder"] = str(folder)
     _save_app_config(config)
     return folder
 
