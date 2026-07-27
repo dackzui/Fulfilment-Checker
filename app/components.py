@@ -144,7 +144,8 @@ def muted(text: str, size: int = 13) -> ft.Text:
     return ft.Text(text, size=size, color=TEXT_MUTED, font_family=FONT_FAMILY)
 
 
-def app_footer() -> ft.Container:
+def app_footer(*, bottom_inset: float = 0) -> ft.Container:
+    """App credits bar along the bottom of the main content."""
     from app.metadata import app_metadata
     from app.picker_helper import CREDIT_AUTHOR
 
@@ -170,7 +171,13 @@ def app_footer() -> ft.Container:
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         ),
-        padding=ft.Padding.symmetric(horizontal=24, vertical=10),
+        padding=ft.Padding.only(
+            left=24,
+            right=24,
+            top=10,
+            # Extra bottom space on tablets so the system taskbar does not cover text.
+            bottom=10 + max(0.0, float(bottom_inset or 0)),
+        ),
         border=ft.Border(top=ft.BorderSide(1, BORDER)),
         bgcolor=BG_INPUT,
     )

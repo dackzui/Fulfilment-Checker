@@ -58,12 +58,14 @@ class ScannerApp:
 
         self.page_body = ft.Container(expand=True)
         self.update_banner = ft.Container(visible=False)
+        # Tablets only: lift footer above the system taskbar. Desktop stays unchanged.
+        footer_inset = 56.0 if page.platform.is_mobile() else 0.0
         self.content_area = ft.Container(
             content=ft.Column(
                 [
                     self.update_banner,
                     self.page_body,
-                    app_footer(),
+                    app_footer(bottom_inset=footer_inset),
                 ],
                 expand=True,
                 spacing=0,
@@ -84,6 +86,35 @@ class ScannerApp:
         page.add(self.layout)
         self.navigate("home")
         self._start_update_check()
+        self._start_auto_sync_scheduler()
+
+    def _start_auto_sync_scheduler(self) -> None:
+        from app import scheduled_sync
+
+        def on_status(message: str) -> None:
+            lower = (message or "").lower()
+            if not (
+                "complete" in lower
+                or "failed" in lower
+                or "nothing to sync" in lower
+            ):
+                return
+
+            def show():
+                try:
+                    self.show_snack(message, error="failed" in lower)
+                except Exception:
+                    pass
+
+            try:
+                self.page.run_thread(show)
+            except Exception:
+                show()
+
+        scheduled_sync.start_auto_sync_scheduler(
+            get_checker_username=lambda: self.admin_username,
+            on_status=on_status,
+        )
 
     def _build_sidebar(self) -> ft.Container:
         self.nav_buttons = {
@@ -517,6 +548,12 @@ def main(page: ft.Page):
             page.window.height = 800
             page.window.min_width = 900
             page.window.min_height = 600
+            page.window.max_width = None
+            page.window.max_height = None
+            page.window.resizable = True
+            page.window.maximizable = True
+            page.window.minimizable = True
+            page.window.full_screen = False
             await page.window.center()
             await page.window.to_front()
         ScannerApp(page)

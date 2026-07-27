@@ -880,6 +880,137 @@ def build(
         muted("Only signed-in Admin or Super Admin can change cloud settings.")
     )
 
+    # --- Daily auto-sync --------------------------------------------------------
+
+    from datetime import time as dt_time
+
+    from app import scheduled_sync
+
+    auto_enabled = scheduled_sync.get_auto_sync_enabled()
+    auto_time = scheduled_sync.get_auto_sync_time()
+    auto_status = muted(scheduled_sync.auto_sync_status_text())
+    auto_switch = ft.Switch(
+        label="Auto-sync today's sessions",
+        value=auto_enabled,
+        disabled=not is_admin,
+    )
+    time_label = muted(f"Scheduled time: {auto_time}")
+
+    def refresh_auto_status():
+        auto_status.value = scheduled_sync.auto_sync_status_text()
+        time_label.value = f"Scheduled time: {scheduled_sync.get_auto_sync_time()}"
+        page.update()
+
+    def save_auto_sync(enabled: bool | None = None, sync_time: str | None = None):
+        if not is_admin:
+            open_login_dialog()
+            return
+        try:
+            scheduled_sync.set_auto_sync(
+                enabled=auto_switch.value if enabled is None else enabled,
+                sync_time=sync_time or scheduled_sync.get_auto_sync_time(),
+            )
+            refresh_auto_status()
+            show_snack("Daily auto-sync settings saved.")
+        except Exception as exc:
+            show_snack(str(exc), error=True)
+            auto_switch.value = scheduled_sync.get_auto_sync_enabled()
+            page.update()
+
+    def on_auto_switch(e):
+        if not is_admin:
+            auto_switch.value = scheduled_sync.get_auto_sync_enabled()
+            page.update()
+            open_login_dialog()
+            return
+        save_auto_sync(enabled=bool(e.control.value))
+
+    auto_switch.on_change = on_auto_switch
+
+    def open_time_picker(_=None):
+        if not is_admin:
+            open_login_dialog()
+            return
+        current = scheduled_sync.get_auto_sync_time()
+        h, m = map(int, current.split(":"))
+
+        def on_time_change(e):
+            value = e.control.value
+            if value is None:
+                return
+            stamp = f"{value.hour:02d}:{value.minute:02d}"
+            save_auto_sync(enabled=auto_switch.value, sync_time=stamp)
+
+        picker = ft.TimePicker(
+            value=dt_time(hour=h, minute=m),
+            help_text="Daily sync time",
+            confirm_text="Save",
+            cancel_text="Cancel",
+            hour_format=ft.TimePickerHourFormat.H24,
+            on_change=on_time_change,
+        )
+        page.show_dialog(picker)
+
+    def run_auto_sync_now(_=None):
+        if not is_admin:
+            open_login_dialog()
+            return
+
+        def work():
+            try:
+                result = scheduled_sync.run_todays_sessions_sync(
+                    checker_username=admin_username,
+                    force=True,
+                )
+                refresh_auto_status()
+                if result is None:
+                    show_snack("No sessions for today to sync (or already nothing to do).")
+                else:
+                    show_snack(
+                        f"Synced {len(result.uploaded)} file(s) for today."
+                    )
+            except Exception as exc:
+                show_snack(f"Sync failed: {exc}", error=True)
+
+        show_snack("Syncing today's sessions…")
+        page.run_thread(work)
+
+    auto_sync_section = _card(
+        "Daily Auto-Sync",
+        "When enabled, all sessions for today are synced around the time you set "
+        "(while the app is open). Uses your Cloud Sync folder or signed-in Drive.",
+        auto_switch,
+        time_label,
+        auto_status,
+        ft.Row(
+            [
+                ft.OutlinedButton(
+                    "Set time",
+                    icon=ft.Icons.SCHEDULE,
+                    height=MIN_TOUCH,
+                    disabled=not is_admin,
+                    on_click=open_time_picker,
+                ),
+                ft.ElevatedButton(
+                    "Sync today now",
+                    icon=ft.Icons.CLOUD_UPLOAD,
+                    bgcolor=PRIMARY if is_admin else "#9E9E9E",
+                    color=ft.Colors.WHITE,
+                    height=MIN_TOUCH,
+                    disabled=not is_admin,
+                    on_click=run_auto_sync_now,
+                ),
+            ],
+            spacing=12,
+            wrap=True,
+        ),
+        muted(
+            "Tip: leave the app open near the scheduled time. "
+            "If the tablet was asleep, it will catch up within about 5 minutes "
+            "after the set time when the app is active again."
+        ),
+    )
+
     cloud_section = _card(
         "Cloud Sync",
         "Send History reports to a sync folder or OneDrive/Google Drive. "
@@ -898,6 +1029,8 @@ def build(
                 barcode_section,
                 ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
                 cloud_section,
+                ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
+                auto_sync_section,
             ],
             scroll=ft.ScrollMode.AUTO,
             expand=True,
