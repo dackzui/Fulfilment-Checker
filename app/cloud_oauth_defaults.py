@@ -21,7 +21,8 @@ GOOGLE_CLIENT_SECRET = ""
 
 # Azure public client (mobile/desktop) — device code login, no secret needed.
 MICROSOFT_CLIENT_ID = ""
-MICROSOFT_TENANT = "consumers"
+# Work/school OneDrive (DEKS): use "organizations". Personal Microsoft: "consumers".
+MICROSOFT_TENANT = "organizations"
 
 
 def builtin_google() -> dict[str, str]:

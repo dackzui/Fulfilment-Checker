@@ -724,46 +724,68 @@ def build(
         show_snack(f"Signed out of {cloud_sync.PROVIDER_LABELS.get(provider, provider)}.")
 
     oauth_buttons: list[ft.Control] = []
-    if cloud_sync.oauth_available(cloud_sync.PROVIDER_GOOGLE):
-        if cloud_sync.is_signed_in(cloud_sync.PROVIDER_GOOGLE):
-            oauth_buttons.append(
-                ft.OutlinedButton(
-                    "Sign out of Google Drive",
-                    height=MIN_TOUCH,
-                    on_click=lambda _: sign_out_provider(cloud_sync.PROVIDER_GOOGLE),
-                )
+
+    def start_provider_or_setup(provider: str):
+        if cloud_sync.oauth_available(provider):
+            run_cloud_sign_in(provider)
+            return
+        if is_super_admin:
+            open_oauth_setup_dialog()
+            show_snack(
+                "Enter the Microsoft/Google app ID, tap Save, then Sign in again."
             )
-        else:
-            oauth_buttons.append(
-                ft.ElevatedButton(
-                    "Sign in with Google Drive",
-                    icon=ft.Icons.CLOUD,
-                    bgcolor=PRIMARY,
-                    color=ft.Colors.WHITE,
-                    height=MIN_TOUCH,
-                    on_click=lambda _: run_cloud_sign_in(cloud_sync.PROVIDER_GOOGLE),
-                )
+            return
+        show_snack(
+            "Cloud login is not enabled yet. Ask Super Admin to open Settings → "
+            "Cloud Sync → Enable Google / OneDrive login.",
+            error=True,
+        )
+
+    if cloud_sync.oauth_available(cloud_sync.PROVIDER_ONEDRIVE) and cloud_sync.is_signed_in(
+        cloud_sync.PROVIDER_ONEDRIVE
+    ):
+        oauth_buttons.append(
+            ft.OutlinedButton(
+                "Sign out of OneDrive",
+                height=MIN_TOUCH,
+                on_click=lambda _: sign_out_provider(cloud_sync.PROVIDER_ONEDRIVE),
             )
-    if cloud_sync.oauth_available(cloud_sync.PROVIDER_ONEDRIVE):
-        if cloud_sync.is_signed_in(cloud_sync.PROVIDER_ONEDRIVE):
-            oauth_buttons.append(
-                ft.OutlinedButton(
-                    "Sign out of OneDrive",
-                    height=MIN_TOUCH,
-                    on_click=lambda _: sign_out_provider(cloud_sync.PROVIDER_ONEDRIVE),
-                )
+        )
+    else:
+        oauth_buttons.append(
+            ft.ElevatedButton(
+                "Sign in with OneDrive",
+                icon=ft.Icons.CLOUD_UPLOAD,
+                bgcolor=PRIMARY,
+                color=ft.Colors.WHITE,
+                height=MIN_TOUCH,
+                disabled=not is_admin,
+                on_click=lambda _: start_provider_or_setup(cloud_sync.PROVIDER_ONEDRIVE),
             )
-        else:
-            oauth_buttons.append(
-                ft.ElevatedButton(
-                    "Sign in with OneDrive",
-                    icon=ft.Icons.CLOUD_UPLOAD,
-                    bgcolor=PRIMARY,
-                    color=ft.Colors.WHITE,
-                    height=MIN_TOUCH,
-                    on_click=lambda _: run_cloud_sign_in(cloud_sync.PROVIDER_ONEDRIVE),
-                )
+        )
+
+    if cloud_sync.oauth_available(cloud_sync.PROVIDER_GOOGLE) and cloud_sync.is_signed_in(
+        cloud_sync.PROVIDER_GOOGLE
+    ):
+        oauth_buttons.append(
+            ft.OutlinedButton(
+                "Sign out of Google Drive",
+                height=MIN_TOUCH,
+                on_click=lambda _: sign_out_provider(cloud_sync.PROVIDER_GOOGLE),
             )
+        )
+    else:
+        oauth_buttons.append(
+            ft.ElevatedButton(
+                "Sign in with Google Drive",
+                icon=ft.Icons.CLOUD,
+                bgcolor=PRIMARY if cloud_sync.oauth_available(cloud_sync.PROVIDER_GOOGLE) else "#9E9E9E",
+                color=ft.Colors.WHITE,
+                height=MIN_TOUCH,
+                disabled=not is_admin,
+                on_click=lambda _: start_provider_or_setup(cloud_sync.PROVIDER_GOOGLE),
+            )
+        )
 
     def open_oauth_setup_dialog(_=None):
         if not is_super_admin:
@@ -792,7 +814,7 @@ def build(
         ms_tenant = ft.TextField(
             label="Microsoft tenant",
             value=m.get("tenant") or "organizations",
-            hint_text="organizations (work) or consumers (personal)",
+            hint_text="organizations = work OneDrive (DEKS)",
             dense=True,
         )
 
@@ -808,7 +830,7 @@ def build(
                     microsoft_tenant=ms_tenant.value or "organizations",
                 )
                 page.pop_dialog()
-                show_snack("Cloud login settings saved. Re-open Settings to refresh buttons.")
+                show_snack("Cloud login enabled. Tap Sign in with OneDrive.")
                 navigate("settings")
             except Exception as exc:
                 show_snack(str(exc), error=True)
@@ -816,24 +838,29 @@ def build(
         page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title=ft.Text("Enable Google / OneDrive login"),
+                title=ft.Text("Enable cloud login (OneDrive / Google)"),
                 content=ft.Column(
                     [
                         muted(
-                            "Register an app once in Google Cloud Console and Azure "
-                            "Portal, then paste the IDs here. Tablets need this — "
-                            "they cannot use the Google Drive folder picker."
+                            "Tablets cannot save into Google Drive/OneDrive through "
+                            "the Files picker. Sign-in uploads via Microsoft/Google API.\n\n"
+                            "OneDrive (DEKS work account) — Azure Portal once:\n"
+                            "1. App registrations → New registration\n"
+                            "2. Accounts in any org directory\n"
+                            "3. Platform: Mobile and desktop → public client\n"
+                            "4. API permissions: Files.ReadWrite, User.Read, offline_access\n"
+                            "5. Copy Application (client) ID here; tenant = organizations"
                         ),
-                        google_id,
-                        google_secret,
                         ms_id,
                         ms_tenant,
+                        google_id,
+                        google_secret,
                     ],
                     tight=True,
                     spacing=10,
-                    width=420,
+                    width=440,
                     scroll=ft.ScrollMode.AUTO,
-                    height=360,
+                    height=420,
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=close_dialog),
@@ -843,40 +870,63 @@ def build(
         )
 
     cloud_controls: list[ft.Control] = [
-        muted(
-            "Tablet: tap “Choose from Files” and pick a folder under "
-            "Internal storage → Download or Documents. "
-            "Do not select Google Drive or OneDrive (Android blocks those). "
-            "PC: choose your real OneDrive folder on disk "
-            "(e.g. OneDrive - DEKS Industries…)."
-            if on_mobile
-            else "PC: pick your real OneDrive/Google Drive folder on disk "
-            "(e.g. OneDrive - DEKS Industries…). "
-            "On tablets, use the Files app picker for Internal storage folders."
-        ),
         ft.Text(
-            "Sync folder"
-            + (" (tablet — Files app)" if on_mobile else " (PC OneDrive / Drive folder)"),
+            "Save to cloud (recommended on tablet)",
             weight=ft.FontWeight.W_600,
             font_family=FONT_FAMILY,
         ),
-        folder_label,
-        ft.Row(
-            [
-                ft.ElevatedButton(
-                    "Choose from Files" if on_mobile else "Choose cloud folder",
-                    icon=ft.Icons.FOLDER_OPEN if is_admin else ft.Icons.LOCK,
-                    bgcolor=PRIMARY if is_admin else "#9E9E9E",
-                    color=ft.Colors.WHITE,
-                    height=MIN_TOUCH,
-                    on_click=lambda _: page.run_task(pick_sync_folder),
-                ),
-                clear_folder_btn,
-            ],
-            spacing=12,
-            wrap=True,
+        muted(
+            "Android Files cannot write to Google Drive / OneDrive folders. "
+            "Sign in below to upload reports straight to the cloud. "
+            "Then use History → Sync (or Sync today now)."
         ),
+        oauth_status_label,
+        ft.Row(oauth_buttons, spacing=12, wrap=True),
     ]
+    if is_super_admin:
+        cloud_controls.append(
+            ft.TextButton(
+                "Enable Google / OneDrive login…",
+                icon=ft.Icons.KEY,
+                on_click=open_oauth_setup_dialog,
+            )
+        )
+    elif not cloud_sync.oauth_available():
+        cloud_controls.append(
+            muted(
+                "OneDrive / Google login is not enabled yet. "
+                "Ask Super Admin to tap Enable Google / OneDrive login."
+            )
+        )
+
+    cloud_controls.extend(
+        [
+            ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
+            ft.Text(
+                "Save on this device only (optional)",
+                weight=ft.FontWeight.W_600,
+                font_family=FONT_FAMILY,
+            ),
+            muted(
+                "Local backup folder on the tablet/PC — not the same as cloud Drive. "
+                "On tablet use Internal storage → Download if needed."
+            ),
+            folder_label,
+            ft.Row(
+                [
+                    ft.OutlinedButton(
+                        "Choose from Files" if on_mobile else "Choose cloud folder",
+                        icon=ft.Icons.FOLDER_OPEN if is_admin else ft.Icons.LOCK,
+                        height=MIN_TOUCH,
+                        on_click=lambda _: page.run_task(pick_sync_folder),
+                    ),
+                    clear_folder_btn,
+                ],
+                spacing=12,
+                wrap=True,
+            ),
+        ]
+    )
     if not on_mobile:
         cloud_controls.append(
             ft.Row(
@@ -889,35 +939,6 @@ def build(
                     ),
                 ],
                 spacing=8,
-            )
-        )
-    cloud_controls.extend(
-        [
-            ft.Divider(height=12, color=ft.Colors.TRANSPARENT),
-            ft.Text(
-                "Direct cloud login (optional)",
-                weight=ft.FontWeight.W_600,
-                font_family=FONT_FAMILY,
-            ),
-            oauth_status_label,
-        ]
-    )
-    if oauth_buttons:
-        cloud_controls.append(ft.Row(oauth_buttons, spacing=12, wrap=True))
-    else:
-        cloud_controls.append(
-            muted(
-                "Google Drive and OneDrive sign-in are not enabled yet. "
-                "Ask Super Admin to tap “Enable Google / OneDrive login”. "
-                "On tablets you can still sync to Downloads with the button above."
-            )
-        )
-    if is_super_admin:
-        cloud_controls.append(
-            ft.TextButton(
-                "Enable Google / OneDrive login…",
-                icon=ft.Icons.KEY,
-                on_click=open_oauth_setup_dialog,
             )
         )
     cloud_controls.append(

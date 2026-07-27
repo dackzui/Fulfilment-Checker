@@ -383,10 +383,17 @@ def build(
         show_snack(f"Exported {len(full_sessions)} session(s) to PDF.")
 
     def open_sync_dialog(_=None):
+        from flet.utils.platform_utils import is_mobile
+
+        on_mobile = is_mobile()
         if not cloud_sync.credentials_configured():
             show_snack(
                 "Cloud sync is not set up. Open Settings → Cloud Sync and "
-                "choose your Google Drive or OneDrive folder on this device.",
+                + (
+                    "Sign in with OneDrive (recommended on tablet)."
+                    if on_mobile
+                    else "choose your Google Drive or OneDrive folder."
+                ),
                 error=True,
             )
             return
@@ -394,14 +401,18 @@ def build(
         has_date_filter = bool(
             (date_from_field.value or "").strip() or (date_to_field.value or "").strip()
         )
-        if cloud_sync.get_sync_folder() is not None:
-            default_provider = cloud_sync.PROVIDER_FOLDER
+        if cloud_sync.is_signed_in(cloud_sync.PROVIDER_ONEDRIVE):
+            default_provider = cloud_sync.PROVIDER_ONEDRIVE
         elif cloud_sync.is_signed_in(cloud_sync.PROVIDER_GOOGLE):
             default_provider = cloud_sync.PROVIDER_GOOGLE
-        elif cloud_sync.is_signed_in(cloud_sync.PROVIDER_ONEDRIVE):
+        elif (not on_mobile) and cloud_sync.get_sync_folder() is not None:
+            default_provider = cloud_sync.PROVIDER_FOLDER
+        elif cloud_sync.oauth_available(cloud_sync.PROVIDER_ONEDRIVE):
             default_provider = cloud_sync.PROVIDER_ONEDRIVE
         elif cloud_sync.oauth_available(cloud_sync.PROVIDER_GOOGLE):
             default_provider = cloud_sync.PROVIDER_GOOGLE
+        elif cloud_sync.get_sync_folder() is not None:
+            default_provider = cloud_sync.PROVIDER_FOLDER
         else:
             default_provider = cloud_sync.PROVIDER_ONEDRIVE
 
@@ -420,11 +431,13 @@ def build(
         )
 
         provider_options = []
-        if cloud_sync.get_sync_folder() is not None:
+        if cloud_sync.oauth_available(cloud_sync.PROVIDER_ONEDRIVE):
+            signed = cloud_sync.is_signed_in(cloud_sync.PROVIDER_ONEDRIVE)
             provider_options.append(
                 ft.Radio(
-                    value=cloud_sync.PROVIDER_FOLDER,
-                    label="Cloud folder on this device (recommended)",
+                    value=cloud_sync.PROVIDER_ONEDRIVE,
+                    label="OneDrive (cloud)"
+                    + (" — signed in" if signed else " — sign in when syncing"),
                 )
             )
         if cloud_sync.oauth_available(cloud_sync.PROVIDER_GOOGLE):
@@ -432,20 +445,25 @@ def build(
             provider_options.append(
                 ft.Radio(
                     value=cloud_sync.PROVIDER_GOOGLE,
-                    label="Google Drive" + (" (signed in)" if signed else " (sign in)"),
+                    label="Google Drive (cloud)"
+                    + (" — signed in" if signed else " — sign in when syncing"),
                 )
             )
-        if cloud_sync.oauth_available(cloud_sync.PROVIDER_ONEDRIVE):
-            signed = cloud_sync.is_signed_in(cloud_sync.PROVIDER_ONEDRIVE)
+        if cloud_sync.get_sync_folder() is not None:
             provider_options.append(
                 ft.Radio(
-                    value=cloud_sync.PROVIDER_ONEDRIVE,
-                    label="OneDrive" + (" (signed in)" if signed else " (sign in)"),
+                    value=cloud_sync.PROVIDER_FOLDER,
+                    label=(
+                        "Folder on this device"
+                        if on_mobile
+                        else "Cloud folder on this device (PC OneDrive/Drive sync)"
+                    ),
                 )
             )
         if not provider_options:
             show_snack(
-                "Open Settings → Cloud Sync and choose a cloud folder first.",
+                "Open Settings → Cloud Sync and Sign in with OneDrive "
+                "(or choose a local folder).",
                 error=True,
             )
             return

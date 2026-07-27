@@ -87,12 +87,13 @@ def auto_sync_status_text() -> str:
 
 
 def resolve_auto_sync_provider() -> str | None:
-    if cloud_sync.get_sync_folder() is not None:
-        return cloud_sync.PROVIDER_FOLDER
-    if cloud_sync.is_signed_in(cloud_sync.PROVIDER_GOOGLE):
-        return cloud_sync.PROVIDER_GOOGLE
+    # Prefer real cloud upload (API) when signed in — especially important on tablets.
     if cloud_sync.is_signed_in(cloud_sync.PROVIDER_ONEDRIVE):
         return cloud_sync.PROVIDER_ONEDRIVE
+    if cloud_sync.is_signed_in(cloud_sync.PROVIDER_GOOGLE):
+        return cloud_sync.PROVIDER_GOOGLE
+    if cloud_sync.get_sync_folder() is not None:
+        return cloud_sync.PROVIDER_FOLDER
     return None
 
 
