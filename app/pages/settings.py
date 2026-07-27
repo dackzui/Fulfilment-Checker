@@ -513,8 +513,6 @@ def build(
             open_login_dialog()
             return
         if on_mobile:
-            # Android Drive/OneDrive shortcuts are not real folders — offer
-            # writable local targets instead of the broken system picker.
             await choose_mobile_sync_folder()
             return
         try:
@@ -528,6 +526,28 @@ def build(
             return
         try:
             apply_sync_folder(path)
+        except Exception as exc:
+            show_snack(str(exc), error=True)
+
+    async def browse_system_folder(_=None):
+        """Optional Android Files picker — local folders only, not Drive shortcuts."""
+        if not is_admin:
+            open_login_dialog()
+            return
+        try:
+            path = await file_picker.get_directory_path(
+                dialog_title="Choose a local folder (not Google Drive / OneDrive)"
+            )
+        except Exception as exc:
+            show_snack(f"Folder picker failed: {exc}", error=True)
+            return
+        if not path:
+            return
+        try:
+            apply_sync_folder(path)
+            show_snack(
+                "Folder set. Tip: pick Downloads or Documents — not Google Drive."
+            )
         except Exception as exc:
             show_snack(str(exc), error=True)
 
@@ -562,10 +582,21 @@ def build(
             except Exception as exc:
                 show_snack(str(exc), error=True)
 
-        radios = [
-            ft.Radio(value=str(path), label=f"{name}  →  {path}")
-            for name, path in targets
-        ]
+        def browse(_=None):
+            page.pop_dialog()
+            page.run_task(browse_system_folder)
+
+        radios = []
+        for name, path in targets:
+            short = str(path)
+            if len(short) > 64:
+                short = "…" + short[-60:]
+            radios.append(
+                ft.Radio(
+                    value=str(path),
+                    label=f"{name}\n{short}",
+                )
+            )
         group = ft.RadioGroup(
             value=selected["value"],
             content=ft.Column(radios, tight=True, spacing=8),
@@ -578,22 +609,23 @@ def build(
                 content=ft.Column(
                     [
                         muted(
-                            "Android cannot open Google Drive / OneDrive from the "
-                            "folder picker. Choose a local folder below. History → "
-                            "Sync will copy reports there (e.g. Downloads / "
-                            f"{cloud_sync.CLOUD_FOLDER_NAME}). "
-                            "For direct cloud upload, use Sign in with OneDrive."
+                            "On tablets this is different from PC: Android cannot "
+                            "select Google Drive / OneDrive as a normal folder. "
+                            "Prefer “Shared Downloads” so you can open files in the "
+                            "Files app. For direct cloud upload later, use Sign in "
+                            "with OneDrive."
                         ),
                         group,
                     ],
                     tight=True,
                     spacing=12,
                     width=420,
-                    height=360,
+                    height=380,
                     scroll=ft.ScrollMode.AUTO,
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=close_dialog),
+                    ft.TextButton("Browse Files…", on_click=browse),
                     ft.TextButton("Use this folder", on_click=confirm),
                 ],
             )

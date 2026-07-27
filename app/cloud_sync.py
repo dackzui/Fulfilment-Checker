@@ -192,6 +192,34 @@ def _folder_is_writable(folder: Path) -> bool:
         return False
 
 
+def _is_app_private_path(path: Path | str) -> bool:
+    text = str(path).replace("\\", "/").lower()
+    return any(
+        marker in text
+        for marker in (
+            "/android/data/",
+            "/data/user/",
+            "/app_flutter/",
+            "/picker_check_data/",
+        )
+    )
+
+
+def _friendly_mobile_label(preferred: str, folder: Path) -> str:
+    if _is_app_private_path(folder):
+        if "download" in preferred.lower():
+            return "App Downloads (only this app can see it)"
+        if "document" in preferred.lower():
+            return "App documents (only this app can see it)"
+        return f"{preferred} (app private)"
+    text = str(folder).replace("\\", "/").lower()
+    if "/download" in text:
+        return "Shared Downloads (visible in Files app)"
+    if "/document" in text:
+        return "Shared Documents (visible in Files app)"
+    return preferred
+
+
 async def resolve_mobile_sync_targets(page) -> list[tuple[str, Path]]:
     """Writable folders tablets can use without the Android Drive picker."""
     from flet.controls.services.storage_paths import StoragePaths
@@ -201,7 +229,6 @@ async def resolve_mobile_sync_targets(page) -> list[tuple[str, Path]]:
         return []
 
     storage = StoragePaths()
-    # Ensure the service is attached to the active page.
     try:
         if storage not in page.services:
             page.services.append(storage)
@@ -211,43 +238,52 @@ async def resolve_mobile_sync_targets(page) -> list[tuple[str, Path]]:
     found: list[tuple[str, Path]] = []
     seen: set[str] = set()
 
-    async def add(label: str, raw: str | None) -> None:
+    def add(label: str, raw: str | Path | None) -> None:
         if not raw:
             return
         base = Path(str(raw))
-        # Keep exports in a predictable subfolder users can open in Files / Drive.
         folder = base / CLOUD_FOLDER_NAME
-        key = str(folder).lower()
+        key = str(folder.resolve()).lower() if folder.exists() else str(folder).lower()
         if key in seen:
             return
         if not _folder_is_writable(folder):
             return
         seen.add(key)
-        found.append((label, folder))
+        found.append((_friendly_mobile_label(label, folder), folder))
+
+    # Prefer real shared folders the Files app can open (not app-private paths).
+    for label, candidate in (
+        ("Shared Downloads", "/storage/emulated/0/Download"),
+        ("Shared Downloads", "/storage/emulated/0/Downloads"),
+        ("Shared Documents", "/storage/emulated/0/Documents"),
+    ):
+        add(label, candidate)
 
     try:
-        await add("Downloads", await storage.get_downloads_directory())
+        add("Downloads", await storage.get_downloads_directory())
     except Exception:
         pass
     try:
-        await add("App documents", await storage.get_application_documents_directory())
+        add("App documents", await storage.get_application_documents_directory())
     except Exception:
         pass
     try:
-        await add("External storage", await storage.get_external_storage_directory())
+        add("External storage", await storage.get_external_storage_directory())
     except Exception:
         pass
     try:
         externals = await storage.get_external_storage_directories() or []
         for idx, raw in enumerate(externals):
-            await add(f"Shared storage {idx + 1}", raw)
+            add(f"Shared storage {idx + 1}", raw)
     except Exception:
         pass
 
-    # Always-available fallback inside app data.
     from app.paths import get_data_dir
 
-    await add("App data", str(get_data_dir() / "exports"))
+    add("App data", get_data_dir() / "exports")
+
+    # Put shared (non-private) options first.
+    found.sort(key=lambda item: (1 if _is_app_private_path(item[1]) else 0, item[0]))
     return found
 
 
