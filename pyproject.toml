@@ -27,8 +27,8 @@ org = "com.deks"
 product = "Picking Barcode Scanner"
 company = "DEKS"
 copyright = "Copyright (C) 2026 DEKS Industries Pty Ltd"
-build_version = "1.8.16"
-build_number = 31
+build_version = "1.8.18"
+build_number = 33
 
 [tool.flet.app]
 path = "."

@@ -46,7 +46,11 @@ async def _save_pdf_export(
     file_name: str,
     pdf_bytes: bytes,
 ) -> str | None:
-    """Save a PDF via FilePicker — mobile/tablet requires ``src_bytes``."""
+    """Save a PDF via FilePicker — mobile/tablet requires ``src_bytes``.
+
+    On Android this opens the system Save dialog, where the user can pick
+    Google Drive, OneDrive, Downloads, etc. (Storage Access Framework).
+    """
     save_kwargs = {
         "dialog_title": dialog_title,
         "file_name": file_name,
@@ -62,6 +66,42 @@ async def _save_pdf_export(
     if not page.web and not page.platform.is_mobile():
         Path(dest).write_bytes(pdf_bytes)
     return dest
+
+
+async def _save_todays_report_to_files_app(
+    page: ft.Page,
+    file_picker: ft.FilePicker,
+    *,
+    admin_username: str | None,
+    show_snack,
+) -> bool:
+    """Build today's PDF and let Android Save dialog send it to Drive/Files."""
+    today = date.today().strftime("%d/%m/%Y")
+    rows = database.search_sessions(date_from=today, date_to=today)
+    full_sessions = database.get_sessions_with_items([s["id"] for s in rows])
+    if not full_sessions:
+        show_snack("No sessions for today to save.", error=True)
+        return False
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    checker_tag = _export_checker_tag(admin_username)
+    pdf_bytes = export_report_pdf_bytes(
+        full_sessions,
+        filter_summary=f"Daily report — {today} ({len(full_sessions)} session(s))",
+    )
+    dest = await _save_pdf_export(
+        page,
+        file_picker,
+        dialog_title="Save report — choose Google Drive, OneDrive, or Downloads",
+        file_name=f"picking_report_daily_{checker_tag}_{stamp}.pdf",
+        pdf_bytes=pdf_bytes,
+    )
+    if not dest:
+        return False
+    show_snack(
+        f"Saved {len(full_sessions)} session(s). "
+        "If you picked Google Drive / OneDrive, wait for it to finish uploading."
+    )
+    return True
 
 
 def _filter_field(label: str, control: ft.Control, width: float) -> ft.Container:
@@ -226,7 +266,10 @@ def build(
     filters: dict | None = None,
     on_filters_change=None,
 ) -> ft.Control:
+    from flet.utils.platform_utils import is_mobile
+
     is_admin = bool(admin_username)
+    on_mobile = is_mobile()
     filters = dict(filters or {})
     sales_order = filters.get("sales_order", "")
     date_from = filters.get("date_from", "")
@@ -386,14 +429,88 @@ def build(
         from flet.utils.platform_utils import is_mobile
 
         on_mobile = is_mobile()
+
+        # Tablet: Android Save dialog can write into Google Drive / OneDrive.
+        # "Use this folder" cannot — that is why Drive folder picks failed before.
+        if on_mobile:
+
+            async def save_to_files_cloud(_=None):
+                active = current_filters()
+                rows = database.search_sessions(
+                    sales_order=active["sales_order"],
+                    date_from=active["date_from"],
+                    date_to=active["date_to"],
+                    status=None if active["status"] == "all" else active["status"],
+                )
+                if not rows and not (active["date_from"] or active["date_to"]):
+                    # Default to today when no date filter.
+                    today = date.today().strftime("%d/%m/%Y")
+                    rows = database.search_sessions(date_from=today, date_to=today)
+                full_sessions = database.get_sessions_with_items([s["id"] for s in rows])
+                if not full_sessions:
+                    show_snack("No sessions to save for the current filters.", error=True)
+                    return
+                stamp = datetime.now().strftime("%Y%m%d_%H%M")
+                checker_tag = _export_checker_tag(admin_username)
+                try:
+                    pdf_bytes = export_report_pdf_bytes(
+                        full_sessions,
+                        filter_summary=filter_summary_text(),
+                    )
+                    dest = await _save_pdf_export(
+                        page,
+                        file_picker,
+                        dialog_title=(
+                            "Save to Google Drive / OneDrive / Downloads"
+                        ),
+                        file_name=f"picking_report_{checker_tag}_{stamp}.pdf",
+                        pdf_bytes=pdf_bytes,
+                    )
+                except Exception as exc:
+                    show_snack(f"Save failed: {exc}", error=True)
+                    return
+                if not dest:
+                    return
+                show_snack(
+                    f"Saved {len(full_sessions)} session(s). "
+                    "If you chose Google Drive / OneDrive, wait for upload to finish."
+                )
+
+            page.show_dialog(
+                ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Save report to cloud / Files"),
+                    content=ft.Column(
+                        [
+                            muted(
+                                "On Samsung/Android, choose Google Drive in the "
+                                "Save dialog (not “Use this folder”).\n\n"
+                                "Tap Continue → pick Google Drive (or OneDrive / "
+                                "Downloads) → save the PDF there."
+                            ),
+                        ],
+                        tight=True,
+                        spacing=12,
+                        width=400,
+                    ),
+                    actions=[
+                        ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                        ft.TextButton(
+                            "Continue",
+                            on_click=lambda _: (
+                                page.pop_dialog(),
+                                page.run_task(save_to_files_cloud),
+                            ),
+                        ),
+                    ],
+                )
+            )
+            return
+
         if not cloud_sync.credentials_configured():
             show_snack(
                 "Cloud sync is not set up. Open Settings → Cloud Sync and "
-                + (
-                    "Sign in with OneDrive (recommended on tablet)."
-                    if on_mobile
-                    else "choose your Google Drive or OneDrive folder."
-                ),
+                "choose your Google Drive or OneDrive folder.",
                 error=True,
             )
             return
@@ -809,7 +926,7 @@ def build(
                             on_click=lambda _: page.run_task(export_filtered_report),
                         ),
                         ft.ElevatedButton(
-                            "Sync",
+                            "Save to Drive" if on_mobile else "Sync",
                             icon=ft.Icons.CLOUD_UPLOAD,
                             height=MIN_TOUCH,
                             bgcolor=PRIMARY,

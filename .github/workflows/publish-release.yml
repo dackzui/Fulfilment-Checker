@@ -167,13 +167,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: Picking Barcode Scanner v${{ steps.version.outputs.version }}${{ steps.version.outputs.prerelease == 'true' && ' (Pre-release)' || '' }}
+          name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
           prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           files: ${{ steps.apk.outputs.path }}
           fail_on_unmatched_files: true
           body: |
-            ## Picking Barcode Scanner v${{ steps.version.outputs.version }}${{ steps.version.outputs.prerelease == 'true' && ' (Pre-release)' || '' }}
+            ## ${{ steps.version.outputs.tag }}
 
             ${{ steps.version.outputs.prerelease == 'true' && 'This is a **pre-release** for testing. Do not roll out to all tablets until verified.' || 'A new version is available. Download the APK below and install it over your existing tablet app.' }}
 

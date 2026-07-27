@@ -667,8 +667,20 @@ def build(
         if not is_admin:
             open_login_dialog()
             return
-        status = {"text": f"Signing in to {cloud_sync.PROVIDER_LABELS.get(provider, provider)}…"}
-        status_label = ft.Text(status["text"], size=13, font_family=FONT_FAMILY)
+        if not cloud_sync.oauth_available(provider):
+            show_snack(
+                "Cloud sign-in is not set up in this app build yet. "
+                "DEKS IT needs to register OneDrive/Google once — users only "
+                "sign in with their normal email and password after that.",
+                error=True,
+            )
+            return
+        label = cloud_sync.PROVIDER_LABELS.get(provider, provider)
+        status_label = ft.Text(
+            f"Opening {label} sign-in…",
+            size=13,
+            font_family=FONT_FAMILY,
+        )
 
         def close_dialog(_=None):
             page.pop_dialog()
@@ -682,9 +694,7 @@ def build(
                 cloud_sync.sign_in(provider, on_progress=on_progress)
                 page.pop_dialog()
                 refresh_folder_ui()
-                show_snack(
-                    f"Signed in to {cloud_sync.PROVIDER_LABELS.get(provider, provider)}."
-                )
+                show_snack(f"Signed in to {label}.")
             except Exception as exc:
                 status_label.value = str(exc)
                 page.update()
@@ -693,20 +703,19 @@ def build(
         page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title=ft.Text(
-                    f"Sign in — {cloud_sync.PROVIDER_LABELS.get(provider, provider)}"
-                ),
+                title=ft.Text(f"Sign in — {label}"),
                 content=ft.Column(
                     [
                         muted(
-                            "A browser or device-code prompt may open. "
-                            "Stay on this screen until sign-in finishes."
+                            f"Sign in with your normal {label} email and password "
+                            f"on the Microsoft/Google login page (or device code). "
+                            "You do not enter Client ID or secrets here."
                         ),
                         status_label,
                     ],
                     tight=True,
                     spacing=12,
-                    width=360,
+                    width=380,
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=close_dialog),
@@ -725,19 +734,14 @@ def build(
 
     oauth_buttons: list[ft.Control] = []
 
-    def start_provider_or_setup(provider: str):
+    def start_cloud_sign_in(provider: str):
         if cloud_sync.oauth_available(provider):
             run_cloud_sign_in(provider)
             return
-        if is_super_admin:
-            open_oauth_setup_dialog()
-            show_snack(
-                "Enter the Microsoft/Google app ID, tap Save, then Sign in again."
-            )
-            return
         show_snack(
-            "Cloud login is not enabled yet. Ask Super Admin to open Settings → "
-            "Cloud Sync → Enable Google / OneDrive login.",
+            "Cloud sign-in is not configured in this build yet. "
+            "Ask DEKS IT / Super Admin to enable it once — after that, "
+            "everyone only uses normal email and password.",
             error=True,
         )
 
@@ -756,11 +760,11 @@ def build(
             ft.ElevatedButton(
                 "Sign in with OneDrive",
                 icon=ft.Icons.CLOUD_UPLOAD,
-                bgcolor=PRIMARY,
+                bgcolor=PRIMARY if cloud_sync.oauth_available(cloud_sync.PROVIDER_ONEDRIVE) else "#9E9E9E",
                 color=ft.Colors.WHITE,
                 height=MIN_TOUCH,
                 disabled=not is_admin,
-                on_click=lambda _: start_provider_or_setup(cloud_sync.PROVIDER_ONEDRIVE),
+                on_click=lambda _: start_cloud_sign_in(cloud_sync.PROVIDER_ONEDRIVE),
             )
         )
 
@@ -783,38 +787,39 @@ def build(
                 color=ft.Colors.WHITE,
                 height=MIN_TOUCH,
                 disabled=not is_admin,
-                on_click=lambda _: start_provider_or_setup(cloud_sync.PROVIDER_GOOGLE),
+                on_click=lambda _: start_cloud_sign_in(cloud_sync.PROVIDER_GOOGLE),
             )
         )
 
     def open_oauth_setup_dialog(_=None):
+        """IT-only: bake-in override for app registration IDs (not end-user login)."""
         if not is_super_admin:
-            show_snack("Only Super Admin can enable Google / OneDrive login.", error=True)
+            show_snack("Only Super Admin / IT can configure cloud app registration.", error=True)
             return
         creds = cloud_sync.resolve_credentials()
         g = creds.get("google") or {}
         m = creds.get("microsoft") or {}
         google_id = ft.TextField(
-            label="Google OAuth Client ID",
+            label="Google OAuth Client ID (IT only)",
             value=g.get("client_id") or "",
             dense=True,
         )
         google_secret = ft.TextField(
-            label="Google OAuth Client Secret",
+            label="Google OAuth Client Secret (IT only)",
             value=g.get("client_secret") or "",
             password=True,
             can_reveal_password=True,
             dense=True,
         )
         ms_id = ft.TextField(
-            label="Microsoft (Azure) Application (client) ID",
+            label="Microsoft Application (client) ID (IT only)",
             value=m.get("client_id") or "",
             dense=True,
         )
         ms_tenant = ft.TextField(
             label="Microsoft tenant",
             value=m.get("tenant") or "organizations",
-            hint_text="organizations = work OneDrive (DEKS)",
+            hint_text="organizations = DEKS work OneDrive",
             dense=True,
         )
 
@@ -830,7 +835,7 @@ def build(
                     microsoft_tenant=ms_tenant.value or "organizations",
                 )
                 page.pop_dialog()
-                show_snack("Cloud login enabled. Tap Sign in with OneDrive.")
+                show_snack("Cloud app registration saved. Users can Sign in normally.")
                 navigate("settings")
             except Exception as exc:
                 show_snack(str(exc), error=True)
@@ -838,18 +843,16 @@ def build(
         page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title=ft.Text("Enable cloud login (OneDrive / Google)"),
+                title=ft.Text("IT: cloud app registration"),
                 content=ft.Column(
                     [
                         muted(
-                            "Tablets cannot save into Google Drive/OneDrive through "
-                            "the Files picker. Sign-in uploads via Microsoft/Google API.\n\n"
-                            "OneDrive (DEKS work account) — Azure Portal once:\n"
-                            "1. App registrations → New registration\n"
-                            "2. Accounts in any org directory\n"
-                            "3. Platform: Mobile and desktop → public client\n"
-                            "4. API permissions: Files.ReadWrite, User.Read, offline_access\n"
-                            "5. Copy Application (client) ID here; tenant = organizations"
+                            "End users never see these fields. This is the app’s "
+                            "identity with Microsoft/Google (registered once). "
+                            "After Save, Sign in asks only for the user’s normal "
+                            "email and password on the Microsoft/Google website.\n\n"
+                            "Preferred: put the IDs in the app build so every "
+                            "tablet works without this screen."
                         ),
                         ms_id,
                         ms_tenant,
@@ -860,7 +863,7 @@ def build(
                     spacing=10,
                     width=440,
                     scroll=ft.ScrollMode.AUTO,
-                    height=420,
+                    height=400,
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=close_dialog),
@@ -869,33 +872,97 @@ def build(
             )
         )
 
-    cloud_controls: list[ft.Control] = [
-        ft.Text(
-            "Save to cloud (recommended on tablet)",
-            weight=ft.FontWeight.W_600,
-            font_family=FONT_FAMILY,
-        ),
-        muted(
-            "Android Files cannot write to Google Drive / OneDrive folders. "
-            "Sign in below to upload reports straight to the cloud. "
-            "Then use History → Sync (or Sync today now)."
-        ),
-        oauth_status_label,
-        ft.Row(oauth_buttons, spacing=12, wrap=True),
-    ]
+    async def save_todays_report_to_drive(_=None):
+        if not is_admin:
+            open_login_dialog()
+            return
+        from app.pages.history import _save_todays_report_to_files_app
+
+        try:
+            await _save_todays_report_to_files_app(
+                page,
+                file_picker,
+                admin_username=admin_username,
+                show_snack=show_snack,
+            )
+        except Exception as exc:
+            show_snack(f"Save failed: {exc}", error=True)
+
+    cloud_controls: list[ft.Control] = []
+    if on_mobile:
+        cloud_controls.extend(
+            [
+                ft.Text(
+                    "Save reports to Google Drive",
+                    weight=ft.FontWeight.W_600,
+                    font_family=FONT_FAMILY,
+                ),
+                muted(
+                    "Samsung can show Google Drive in Files, but this app cannot "
+                    "use “Use this folder” on Drive — Android only gives a shortcut "
+                    "path that Python cannot write to.\n\n"
+                    "What works: History → Save to Drive, or Sync today now below. "
+                    "In the Save dialog, tap the menu (☰) and choose Google Drive "
+                    "(or OneDrive / Downloads), then Save."
+                ),
+                ft.ElevatedButton(
+                    "Save today's report to Drive…",
+                    icon=ft.Icons.CLOUD_UPLOAD,
+                    bgcolor=PRIMARY if is_admin else "#9E9E9E",
+                    color=ft.Colors.WHITE,
+                    height=MIN_TOUCH,
+                    disabled=not is_admin,
+                    on_click=lambda _: page.run_task(save_todays_report_to_drive),
+                ),
+            ]
+        )
+        if cloud_sync.oauth_available():
+            cloud_controls.extend(
+                [
+                    ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
+                    ft.Text(
+                        "Optional: Sign in for automatic upload",
+                        weight=ft.FontWeight.W_600,
+                        font_family=FONT_FAMILY,
+                    ),
+                    muted(
+                        "Only if DEKS IT enabled cloud sign-in in this build. "
+                        "You still use your normal Microsoft/Google password."
+                    ),
+                    oauth_status_label,
+                    ft.Row(oauth_buttons, spacing=12, wrap=True),
+                ]
+            )
+    else:
+        cloud_controls.extend(
+            [
+                ft.Text(
+                    "Save to cloud",
+                    weight=ft.FontWeight.W_600,
+                    font_family=FONT_FAMILY,
+                ),
+                muted(
+                    "Tap Sign in, then use your normal Microsoft or Google email and "
+                    "password on their login page. No Client ID or secret for warehouse users."
+                ),
+                oauth_status_label,
+                ft.Row(oauth_buttons, spacing=12, wrap=True),
+            ]
+        )
+        if not cloud_sync.oauth_available():
+            cloud_controls.append(
+                muted(
+                    "Not ready yet: DEKS IT must register OneDrive/Google for this app "
+                    "once (or Super Admin uses IT setup below). After that, Sign in "
+                    "works with normal username/password only."
+                )
+            )
     if is_super_admin:
         cloud_controls.append(
             ft.TextButton(
-                "Enable Google / OneDrive login…",
+                "IT setup (app registration)…",
                 icon=ft.Icons.KEY,
                 on_click=open_oauth_setup_dialog,
-            )
-        )
-    elif not cloud_sync.oauth_available():
-        cloud_controls.append(
-            muted(
-                "OneDrive / Google login is not enabled yet. "
-                "Ask Super Admin to tap Enable Google / OneDrive login."
             )
         )
 
@@ -903,19 +970,21 @@ def build(
         [
             ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
             ft.Text(
-                "Save on this device only (optional)",
+                "Local folder (optional backup)",
                 weight=ft.FontWeight.W_600,
                 font_family=FONT_FAMILY,
             ),
             muted(
-                "Local backup folder on the tablet/PC — not the same as cloud Drive. "
-                "On tablet use Internal storage → Download if needed."
+                "Tablet: only local folders (e.g. Download) — not Google Drive "
+                "in the folder picker."
+                if on_mobile
+                else "Choose a OneDrive or Google Drive folder on this PC."
             ),
             folder_label,
             ft.Row(
                 [
                     ft.OutlinedButton(
-                        "Choose from Files" if on_mobile else "Choose cloud folder",
+                        "Choose local folder" if on_mobile else "Choose cloud folder",
                         icon=ft.Icons.FOLDER_OPEN if is_admin else ft.Icons.LOCK,
                         height=MIN_TOUCH,
                         on_click=lambda _: page.run_task(pick_sync_folder),
@@ -1021,6 +1090,11 @@ def build(
             open_login_dialog()
             return
 
+        if on_mobile:
+            # Folder sync cannot write to Google Drive shortcuts; use Save dialog.
+            page.run_task(save_todays_report_to_drive)
+            return
+
         def work():
             try:
                 result = scheduled_sync.run_todays_sessions_sync(
@@ -1042,8 +1116,16 @@ def build(
 
     auto_sync_section = _card(
         "Daily Auto-Sync",
-        "When enabled, all sessions for today are synced around the time you set "
-        "(while the app is open). Uses your Cloud Sync folder or signed-in Drive.",
+        (
+            "On tablet, use Sync today now to open the Save dialog and pick "
+            "Google Drive. Automatic silent upload to Drive needs Sign-in "
+            "(IT setup) or a local Download folder."
+            if on_mobile
+            else (
+                "When enabled, all sessions for today are synced around the time you set "
+                "(while the app is open). Uses your Cloud Sync folder or signed-in Drive."
+            )
+        ),
         auto_switch,
         time_label,
         auto_status,
@@ -1073,13 +1155,25 @@ def build(
             "Tip: leave the app open near the scheduled time. "
             "If the tablet was asleep, it will catch up within about 5 minutes "
             "after the set time when the app is active again."
+            if not on_mobile
+            else (
+                "Tip: for Google Drive, tap Sync today now (or History → Save to Drive) "
+                "and choose Google Drive in the Save dialog — not “Use this folder”."
+            )
         ),
     )
 
     cloud_section = _card(
         "Cloud Sync",
-        "Send History reports to a sync folder or OneDrive/Google Drive. "
-        f"Files go under '{cloud_sync.CLOUD_FOLDER_NAME} - <login user>/History'.",
+        (
+            "Save PDF reports into Google Drive via the Android Save dialog. "
+            "Choosing a Drive folder with “Use this folder” does not work on tablet."
+            if on_mobile
+            else (
+                "Send History reports to a sync folder or OneDrive/Google Drive. "
+                f"Files go under '{cloud_sync.CLOUD_FOLDER_NAME} - <login user>/History'."
+            )
+        ),
         *cloud_controls,
     )
 
