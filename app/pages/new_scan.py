@@ -107,9 +107,17 @@ def build(
     )
     checker = text_input(hint="Enter checker name", expand=False)
 
-    def refresh_picker_options(*, keep_value: bool = True):
+    def refresh_picker_options(*, keep_value: bool = True, sync: bool = False):
+        from app import firebase_presence
+
         current = capitalize_person_name(picker.value or "") if keep_value else ""
-        names = list(database.list_picker_names())
+        if sync:
+            try:
+                names = list(firebase_presence.sync_picker_names())
+            except Exception:
+                names = list(database.list_picker_names())
+        else:
+            names = list(database.list_picker_names())
         if current and current not in names:
             names.append(current)
             names.sort(key=str.casefold)
@@ -129,11 +137,11 @@ def build(
         name = capitalize_person_name(picker.value or "").strip()
         if not name:
             return
-        database.remember_picker_name(name)
         from app import firebase_presence
 
+        firebase_presence.remember_picker_name_synced(name)
         firebase_presence.set_default_picker(name)
-        refresh_picker_options(keep_value=True)
+        refresh_picker_options(keep_value=True, sync=False)
 
     def on_picker_blur(_=None):
         if picker.value:
@@ -189,8 +197,13 @@ def build(
         picker_rows = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO, height=280)
 
         def render_picker_rows():
+            from app import firebase_presence
+
             picker_rows.controls.clear()
-            names = database.list_picker_names()
+            try:
+                names = firebase_presence.sync_picker_names()
+            except Exception:
+                names = database.list_picker_names()
             if not names:
                 picker_rows.controls.append(muted("No saved picker names yet."))
                 return
@@ -212,19 +225,24 @@ def build(
                 page.pop_dialog()
 
             def submit_delete(_=None):
-                database.delete_picker_name(picker_name)
-                page.pop_dialog()
-                render_picker_rows()
-                refresh_picker_options()
-                page.update()
-                show_snack(f"Removed picker name — {picker_name}.")
+                from app import firebase_presence
+
+                try:
+                    firebase_presence.delete_picker_name_synced(picker_name)
+                    page.pop_dialog()
+                    render_picker_rows()
+                    refresh_picker_options()
+                    page.update()
+                    show_snack(f"Removed picker name — {picker_name} (all tablets).")
+                except Exception as exc:
+                    show_snack(f"Could not remove picker: {exc}", error=True)
 
             page.show_dialog(
                 ft.AlertDialog(
                     modal=True,
                     title=ft.Text("Remove Picker Name"),
                     content=ft.Text(
-                        f"Remove '{picker_name}' from the picker list?",
+                        f"Remove '{picker_name}' from the picker list on all tablets?",
                         font_family=FONT_FAMILY,
                     ),
                     actions=[
@@ -244,16 +262,26 @@ def build(
         )
 
         def add_picker(_=None):
+            from app import firebase_presence
+
             name = capitalize_person_name(new_picker_field.value or "").strip()
             if not name:
                 show_snack("Enter a picker name.", error=True)
                 return
-            database.remember_picker_name(name)
-            new_picker_field.value = ""
-            render_picker_rows()
-            refresh_picker_options(keep_value=True)
-            page.update()
-            show_snack(f"Added picker — {name}")
+            try:
+                firebase_presence.remember_picker_name_synced(name)
+                new_picker_field.value = ""
+                render_picker_rows()
+                refresh_picker_options(keep_value=True)
+                page.update()
+                if firebase_presence.is_configured():
+                    show_snack(f"Added picker — {name} (synced to all tablets)")
+                else:
+                    show_snack(
+                        f"Added picker — {name} (local only; set up Firebase to sync)"
+                    )
+            except Exception as exc:
+                show_snack(f"Could not add picker: {exc}", error=True)
 
         render_picker_rows()
         page.show_dialog(
@@ -274,7 +302,10 @@ def build(
                             ],
                             vertical_alignment=ft.CrossAxisAlignment.END,
                         ),
-                        muted("Add new names or remove ones no longer needed."),
+                        muted(
+                            "Names sync to all tablets when Firebase is set up. "
+                            "Add new names or remove ones no longer needed."
+                        ),
                         picker_rows,
                     ],
                     tight=True,
@@ -1580,6 +1611,7 @@ def build(
         if resume_session_id:
             load_draft(resume_session_id)
         else:
+            refresh_picker_options(keep_value=True, sync=True)
             apply_default_picker()
             refresh_verification_status()
         update_picker_manage_visibility()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 import threading
 import time
 import uuid
@@ -154,6 +155,153 @@ def set_default_picker(name: str) -> str:
         del cfg[DEFAULT_PICKER_KEY]
     _save_json(_app_config_path(), cfg)
     return cleaned
+
+
+def _picker_names_url(name: str | None = None) -> str:
+    base = f"{resolve_config()['database_url']}/picker_names"
+    if not name:
+        return f"{base}.json"
+    from app.components import capitalize_person_name
+
+    cleaned = capitalize_person_name(name).strip()
+    # Firebase keys cannot contain . # $ [ ]
+    key = re.sub(r"[.#$\[\]]+", "_", cleaned)
+    return f"{base}/{key}.json"
+
+
+def fetch_cloud_picker_names() -> list[str]:
+    """Return global picker names from Firebase (empty if not configured / error)."""
+    if not is_configured():
+        return []
+    token = _ensure_id_token()
+    resp = requests.get(
+        _picker_names_url(),
+        params={"auth": token},
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not load picker names"))
+    raw = resp.json() or {}
+    if not isinstance(raw, dict):
+        return []
+    names: list[str] = []
+    for _key, row in raw.items():
+        if isinstance(row, dict):
+            label = str(row.get("name") or "").strip()
+        else:
+            label = str(row or "").strip()
+        if label:
+            names.append(label)
+    from app.components import capitalize_person_name
+
+    cleaned = sorted(
+        {capitalize_person_name(n) for n in names if n},
+        key=str.casefold,
+    )
+    return cleaned
+
+
+def publish_cloud_picker_name(name: str) -> None:
+    """Add/update one picker name in the shared Firebase list."""
+    from app.components import capitalize_person_name
+
+    cleaned = capitalize_person_name(name or "").strip()
+    if not cleaned or not is_configured():
+        return
+    token = _ensure_id_token()
+    payload = {
+        "name": cleaned,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "firebase_uid": _firebase_uid(),
+    }
+    resp = requests.put(
+        _picker_names_url(cleaned),
+        params={"auth": token},
+        json=payload,
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not save picker name"))
+
+
+def remove_cloud_picker_name(name: str) -> None:
+    """Remove one picker name from the shared Firebase list."""
+    from app.components import capitalize_person_name
+
+    cleaned = capitalize_person_name(name or "").strip()
+    if not cleaned or not is_configured():
+        return
+    token = _ensure_id_token()
+    resp = requests.delete(
+        _picker_names_url(cleaned),
+        params={"auth": token},
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not remove picker name"))
+
+
+def sync_picker_names() -> list[str]:
+    """Pull cloud pickers into local DB, push any local-only names up, return merged list."""
+    from app import database
+
+    local = database.list_picker_names()
+    if not is_configured():
+        return local
+    try:
+        cloud = fetch_cloud_picker_names()
+    except Exception:
+        return local
+
+    cloud_folded = {n.casefold() for n in cloud}
+    local_folded = {n.casefold() for n in local}
+
+    for name in cloud:
+        if name.casefold() not in local_folded:
+            database.remember_picker_name(name)
+
+    for name in local:
+        if name.casefold() not in cloud_folded:
+            try:
+                publish_cloud_picker_name(name)
+            except Exception:
+                pass
+
+    return database.list_picker_names()
+
+
+def remember_picker_name_synced(name: str) -> str:
+    """Save picker locally and to Firebase so all tablets see it."""
+    from app import database
+    from app.components import capitalize_person_name
+
+    cleaned = capitalize_person_name(name or "").strip()
+    if not cleaned:
+        return ""
+    database.remember_picker_name(cleaned)
+    if is_configured():
+        try:
+            publish_cloud_picker_name(cleaned)
+        except Exception:
+            # Local save still succeeded; next sync can retry.
+            pass
+    return cleaned
+
+
+def delete_picker_name_synced(name: str) -> None:
+    """Remove picker locally and from Firebase."""
+    from app import database
+    from app.components import capitalize_person_name
+
+    cleaned = capitalize_person_name(name or "").strip()
+    if not cleaned:
+        return
+    database.delete_picker_name(cleaned)
+    if is_configured():
+        try:
+            remove_cloud_picker_name(cleaned)
+        except Exception:
+            pass
 
 
 def resolve_config() -> dict[str, str]:
