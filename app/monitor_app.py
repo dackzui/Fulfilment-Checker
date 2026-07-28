@@ -166,21 +166,6 @@ async def main(page: ft.Page):
             )
         )
 
-    def show_saved_notice(title: str, message: str):
-        def close(_=None):
-            page.pop_dialog()
-
-        page.show_dialog(
-            ft.AlertDialog(
-                modal=True,
-                title=ft.Text(title, font_family=FONT_FAMILY),
-                content=ft.Text(message, font_family=FONT_FAMILY, size=14),
-                actions=[
-                    ft.TextButton("OK", on_click=close),
-                ],
-            )
-        )
-
     def stop_refresh():
         page._monitor_token = None
 
@@ -469,10 +454,6 @@ async def main(page: ft.Page):
                     def apply():
                         apply_snapshot(snap)
                         show_snack("Week filter updated.")
-                        show_saved_notice(
-                            "Saved",
-                            "Week filter was saved and will update the board and tablets.",
-                        )
                         page.update()
 
                     apply()
@@ -500,10 +481,6 @@ async def main(page: ft.Page):
                         apply_snapshot(snap)
                         settings_status.value = "Prize message saved."
                         show_snack("Prize message saved.")
-                        show_saved_notice(
-                            "Saved",
-                            "Prize message was saved. It will show on the board and tablet Home.",
-                        )
                         page.update()
 
                     apply()
