@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -394,15 +394,62 @@ def fulfilment_counts_by_checker(*, today_only: bool = False) -> dict[str, int]:
     return counts
 
 
+def week_date_bounds(which: str = "this") -> tuple[date, date]:
+    """Return Monday–Sunday bounds. ``which`` is ``this`` or ``last``."""
+    today = date.today()
+    start = today - timedelta(days=today.weekday())
+    end = start + timedelta(days=6)
+    if (which or "this").strip().lower() == "last":
+        start = start - timedelta(days=7)
+        end = end - timedelta(days=7)
+    return start, end
+
+
+def fulfilment_counts_by_checker_range(start: date, end: date) -> dict[str, int]:
+    """Completed fulfilments whose check_date falls in ``start``..``end`` inclusive."""
+    with _connect() as conn:
+        _migrate(conn)
+        rows = conn.execute(
+            """
+            SELECT checker_name, check_date
+            FROM scan_sessions
+            WHERE COALESCE(status, 'completed') = 'completed'
+            """
+        ).fetchall()
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        session_date = _parse_display_date(str(row["check_date"] or ""))
+        if session_date is None or session_date < start or session_date > end:
+            continue
+        name = capitalize_person_name(str(row["checker_name"] or "")).strip()
+        if not name:
+            name = "Unknown"
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
 def local_fulfilment_snapshot() -> dict[str, Any]:
     """Compact stats payload for Firebase presence heartbeats."""
     today_map = fulfilment_counts_by_checker(today_only=True)
     total_map = fulfilment_counts_by_checker(today_only=False)
+    week_start, week_end = week_date_bounds("this")
+    last_start, last_end = week_date_bounds("last")
+    week_map = fulfilment_counts_by_checker_range(week_start, week_end)
+    last_week_map = fulfilment_counts_by_checker_range(last_start, last_end)
     return {
         "today": today_map,
         "total": total_map,
+        "week": week_map,
+        "last_week": last_week_map,
         "today_sum": int(sum(today_map.values())),
         "total_sum": int(sum(total_map.values())),
+        "week_sum": int(sum(week_map.values())),
+        "last_week_sum": int(sum(last_week_map.values())),
+        "week_start": week_start.isoformat(),
+        "week_end": week_end.isoformat(),
+        "last_week_start": last_start.isoformat(),
+        "last_week_end": last_end.isoformat(),
         "as_of": datetime.now().isoformat(timespec="seconds"),
     }
 

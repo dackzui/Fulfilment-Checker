@@ -60,6 +60,10 @@ You can always find them later under **Project settings** (gear) → **Your apps
       "$deviceId": {
         ".write": "auth != null && newData.child('firebase_uid').val() === auth.uid"
       }
+    },
+    "dashboard_settings": {
+      ".read": "auth != null",
+      ".write": "auth != null"
     }
   }
 }
@@ -70,6 +74,7 @@ You can always find them later under **Project settings** (gear) → **Your apps
 Meaning:
 - only signed-in app devices can read the online list
 - a device can only update its own presence row
+- `dashboard_settings` stores the Home week-graph filter (This week / Last week). Only Super Admin should change it in the app UI.
 
 ---
 

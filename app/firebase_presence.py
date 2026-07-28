@@ -49,6 +49,8 @@ class PresenceEntry:
     fulfilments_total: int = 0
     stats_today: dict[str, int] | None = None
     stats_total: dict[str, int] | None = None
+    stats_week: dict[str, int] | None = None
+    stats_last_week: dict[str, int] | None = None
 
 
 @dataclass
@@ -56,8 +58,14 @@ class UserFulfilmentRow:
     username: str
     today: int
     total: int
-    online: bool
-    devices: list[str]
+    week: int = 0
+    last_week: int = 0
+    online: bool = False
+    devices: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.devices is None:
+            self.devices = []
 
 
 def _config_path() -> Path:
@@ -389,6 +397,8 @@ def fetch_presence() -> list[PresenceEntry]:
         local_stats = row.get("local_stats") if isinstance(row.get("local_stats"), dict) else {}
         today_map = _as_int_map(local_stats.get("today"))
         total_map = _as_int_map(local_stats.get("total"))
+        week_map = _as_int_map(local_stats.get("week"))
+        last_week_map = _as_int_map(local_stats.get("last_week"))
         try:
             today_sum = int(local_stats.get("today_sum") or sum(today_map.values()))
         except (TypeError, ValueError):
@@ -412,6 +422,8 @@ def fetch_presence() -> list[PresenceEntry]:
                 fulfilments_total=total_sum,
                 stats_today=today_map,
                 stats_total=total_map,
+                stats_week=week_map,
+                stats_last_week=last_week_map,
             )
         )
 
@@ -429,6 +441,8 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
     """Sum completed fulfilments per checker across all reporting devices."""
     today: dict[str, int] = {}
     total: dict[str, int] = {}
+    week: dict[str, int] = {}
+    last_week: dict[str, int] = {}
     online_users: set[str] = set()
     devices_by_user: dict[str, list[str]] = {}
 
@@ -445,8 +459,15 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
             today[name] = today.get(name, 0) + int(count)
         for name, count in (entry.stats_total or {}).items():
             total[name] = total.get(name, 0) + int(count)
+        for name, count in (entry.stats_week or {}).items():
+            week[name] = week.get(name, 0) + int(count)
+        for name, count in (entry.stats_last_week or {}).items():
+            last_week[name] = last_week.get(name, 0) + int(count)
 
-    names = sorted(set(today) | set(total), key=lambda n: (-today.get(n, 0), n.lower()))
+    names = sorted(
+        set(today) | set(total) | set(week) | set(last_week),
+        key=lambda n: (-today.get(n, 0), n.lower()),
+    )
     rows: list[UserFulfilmentRow] = []
     for name in names:
         matching_devices = []
@@ -458,6 +479,8 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
                 username=name,
                 today=int(today.get(name, 0)),
                 total=int(total.get(name, 0)),
+                week=int(week.get(name, 0)),
+                last_week=int(last_week.get(name, 0)),
                 online=name.casefold() in online_users,
                 devices=matching_devices,
             )
@@ -465,20 +488,85 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
     return rows
 
 
+def _dashboard_settings_url() -> str:
+    return f"{resolve_config()['database_url']}/dashboard_settings.json"
+
+
+def get_week_filter() -> str:
+    """Return ``this`` or ``last``. Falls back to this week."""
+    if not is_configured():
+        cfg = _load_json(_app_config_path())
+        value = str(cfg.get("dashboard_week_filter") or "this").strip().lower()
+        return "last" if value == "last" else "this"
+    try:
+        token = _ensure_id_token()
+        resp = requests.get(
+            _dashboard_settings_url(),
+            params={"auth": token},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return "this"
+        raw = resp.json() or {}
+        if not isinstance(raw, dict):
+            return "this"
+        value = str(raw.get("week_filter") or "this").strip().lower()
+        return "last" if value == "last" else "this"
+    except Exception:
+        return "this"
+
+
+def set_week_filter(which: str, *, updated_by: str | None = None) -> str:
+    """Persist week graph filter. Returns normalized ``this`` or ``last``."""
+    value = "last" if (which or "").strip().lower() == "last" else "this"
+    cfg = _load_json(_app_config_path())
+    cfg["dashboard_week_filter"] = value
+    _save_json(_app_config_path(), cfg)
+
+    if not is_configured():
+        return value
+
+    token = _ensure_id_token()
+    payload = {
+        "week_filter": value,
+        "updated_by": (updated_by or "").strip() or None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "firebase_uid": _firebase_uid(),
+    }
+    resp = requests.put(
+        _dashboard_settings_url(),
+        params={"auth": token},
+        json=payload,
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not save week filter"))
+    return value
+
+
 def dashboard_snapshot() -> dict[str, Any]:
     """Presence + fulfilment rows for the Home dashboard."""
-    if not is_configured():
-        from app import database
+    from app import database
 
+    week_filter = get_week_filter()
+    week_start, week_end = database.week_date_bounds(week_filter)
+    if not is_configured():
         local = database.local_fulfilment_snapshot()
         today = local.get("today") or {}
         total = local.get("total") or {}
-        names = sorted(set(today) | set(total), key=lambda n: (-int(today.get(n, 0)), n.lower()))
+        week = local.get("week") or {}
+        last_week = local.get("last_week") or {}
+        names = sorted(
+            set(today) | set(total) | set(week) | set(last_week),
+            key=lambda n: (-int(today.get(n, 0)), n.lower()),
+        )
         rows = [
             UserFulfilmentRow(
                 username=name,
                 today=int(today.get(name, 0)),
                 total=int(total.get(name, 0)),
+                week=int(week.get(name, 0)),
+                last_week=int(last_week.get(name, 0)),
                 online=False,
                 devices=[],
             )
@@ -491,6 +579,9 @@ def dashboard_snapshot() -> dict[str, Any]:
             "presence": [],
             "fulfilments": rows,
             "today_sum": int(local.get("today_sum") or 0),
+            "week_filter": week_filter,
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
             "source": "local",
         }
 
@@ -504,6 +595,9 @@ def dashboard_snapshot() -> dict[str, Any]:
         "presence": presence,
         "fulfilments": fulfilments,
         "today_sum": sum(r.today for r in fulfilments),
+        "week_filter": week_filter,
+        "week_start": week_start.isoformat(),
+        "week_end": week_end.isoformat(),
         "source": "firebase",
     }
 
