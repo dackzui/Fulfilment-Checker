@@ -6,7 +6,7 @@ import flet as ft
 
 from app import auth
 from app import database
-from app.components import nav_button, app_footer
+from app.components import muted, nav_button, app_footer
 from app.pages import history, home, new_scan, settings
 from app.paths import init_app_storage, logo_src
 from app.theme import BG_MAIN, BG_SIDEBAR, FONT_FAMILY, PRIMARY, SIDEBAR_WIDTH, TEXT
@@ -164,9 +164,52 @@ class ScannerApp:
             margin=ft.Margin.only(top=80),
             alignment=ft.Alignment(0, 0),
         )
+        self._user_status_dot = ft.Container(
+            width=10,
+            height=10,
+            border_radius=5,
+            bgcolor="#2E7D32",
+            opacity=1,
+            animate_opacity=ft.Animation(500, ft.AnimationCurve.EASE_IN_OUT),
+        )
+        self._user_status_name = ft.Text(
+            "",
+            size=13,
+            weight=ft.FontWeight.W_600,
+            color=TEXT,
+            font_family=FONT_FAMILY,
+            text_align=ft.TextAlign.CENTER,
+            max_lines=2,
+            overflow=ft.TextOverflow.ELLIPSIS,
+        )
+        self._user_status_panel = ft.Container(
+            visible=False,
+            width=SIDEBAR_WIDTH - 32,
+            bgcolor=ft.Colors.WHITE,
+            border_radius=8,
+            padding=ft.Padding.symmetric(horizontal=10, vertical=10),
+            content=ft.Column(
+                [
+                    muted("Signed in"),
+                    ft.Row(
+                        [
+                            self._user_status_dot,
+                            self._user_status_name,
+                        ],
+                        spacing=8,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                spacing=6,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                tight=True,
+            ),
+        )
         sidebar_column = ft.Column(
             [
                 logo,
+                self._user_status_panel,
                 self.nav_buttons["home"],
                 self.nav_buttons["new_scan"],
                 self.nav_buttons["history"],
@@ -183,12 +226,66 @@ class ScannerApp:
             if self.page.platform.is_mobile()
             else sidebar_column
         )
+        self._refresh_sidebar_user()
+        self._start_user_status_blink()
         return ft.Container(
             content=sidebar_body,
             width=SIDEBAR_WIDTH,
             bgcolor=BG_SIDEBAR,
             padding=ft.Padding.only(left=16, right=16, bottom=12),
         )
+
+    def _refresh_sidebar_user(self) -> None:
+        panel = getattr(self, "_user_status_panel", None)
+        name_label = getattr(self, "_user_status_name", None)
+        if panel is None or name_label is None:
+            return
+        if self.admin_username:
+            name_label.value = self.admin_username
+            panel.visible = True
+        else:
+            name_label.value = ""
+            panel.visible = False
+            dot = getattr(self, "_user_status_dot", None)
+            if dot is not None:
+                dot.opacity = 1
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+    def _start_user_status_blink(self) -> None:
+        if getattr(self, "_user_status_blink_started", False):
+            return
+        self._user_status_blink_started = True
+
+        def loop():
+            import time
+
+            while True:
+                try:
+                    dot = getattr(self, "_user_status_dot", None)
+                    if dot is not None and self.admin_username:
+                        current = float(dot.opacity if dot.opacity is not None else 1)
+                        dot.opacity = 0.25 if current > 0.6 else 1.0
+                        try:
+                            dot.update()
+                        except Exception:
+                            try:
+                                self.page.update()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                time.sleep(0.7)
+
+        try:
+            self.page.run_thread(loop)
+        except Exception:
+            import threading
+
+            threading.Thread(target=loop, name="user-status-blink", daemon=True).start()
+
 
     def show_snack(self, message: str, *, error: bool = False):
         self.page.show_dialog(
@@ -520,6 +617,7 @@ class ScannerApp:
             self.admin_role = account.role
             self.page._session_username = account.username
             self.page._session_role = account.role
+            self._refresh_sidebar_user()
             self._publish_presence_now(online=True)
             return True
         return False
@@ -532,6 +630,7 @@ class ScannerApp:
         if stored_user:
             self.admin_username = stored_user
             self.admin_role = stored_role
+            self._refresh_sidebar_user()
             return stored_user, stored_role
         return None, None
 
@@ -540,6 +639,7 @@ class ScannerApp:
         self.admin_role = None
         self.page._session_username = None
         self.page._session_role = None
+        self._refresh_sidebar_user()
         # Device stays open; clear logged-in user on the presence board.
         self._publish_presence_now(online=True)
 
