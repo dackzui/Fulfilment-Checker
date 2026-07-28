@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -355,6 +355,56 @@ def session_stats() -> dict[str, int]:
         stats["total"] += count
     return stats
 
+
+def fulfilment_counts_by_checker(*, today_only: bool = False) -> dict[str, int]:
+    """Completed fulfilments (scan sessions) grouped by checker name.
+
+    ``today_only`` matches ``check_date`` in DD/MM/YYYY (local app date format).
+    """
+    today = date.today().strftime("%d/%m/%Y")
+    with _connect() as conn:
+        _migrate(conn)
+        if today_only:
+            rows = conn.execute(
+                """
+                SELECT checker_name, COUNT(*) AS count
+                FROM scan_sessions
+                WHERE COALESCE(status, 'completed') = 'completed'
+                  AND check_date = ?
+                GROUP BY checker_name
+                """,
+                (today,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT checker_name, COUNT(*) AS count
+                FROM scan_sessions
+                WHERE COALESCE(status, 'completed') = 'completed'
+                GROUP BY checker_name
+                """
+            ).fetchall()
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        name = capitalize_person_name(str(row["checker_name"] or "")).strip()
+        if not name:
+            name = "Unknown"
+        counts[name] = counts.get(name, 0) + int(row["count"])
+    return counts
+
+
+def local_fulfilment_snapshot() -> dict[str, Any]:
+    """Compact stats payload for Firebase presence heartbeats."""
+    today_map = fulfilment_counts_by_checker(today_only=True)
+    total_map = fulfilment_counts_by_checker(today_only=False)
+    return {
+        "today": today_map,
+        "total": total_map,
+        "today_sum": int(sum(today_map.values())),
+        "total_sum": int(sum(total_map.values())),
+        "as_of": datetime.now().isoformat(timespec="seconds"),
+    }
 
 def get_session(session_id: int) -> dict[str, Any] | None:
     with _connect() as conn:

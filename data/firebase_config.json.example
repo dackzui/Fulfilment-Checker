@@ -1,0 +1,5 @@
+{
+  "api_key": "YOUR_WEB_API_KEY",
+  "database_url": "https://YOUR_PROJECT_ID-default-rtdb.REGION.firebasedatabase.app",
+  "project_id": "YOUR_PROJECT_ID"
+}

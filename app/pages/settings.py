@@ -1177,11 +1177,252 @@ def build(
         *cloud_controls,
     )
 
+    # --- Who's online (Firebase) ------------------------------------------------
+
+    from app import firebase_presence
+
+    presence_status = muted(firebase_presence.presence_status_text())
+    presence_list = ft.Column(spacing=8, tight=True)
+    tablet_name_field = ft.TextField(
+        label="This tablet's name",
+        value=firebase_presence.get_device_label(),
+        hint_text="e.g. Warehouse Tablet 1",
+        dense=True,
+        expand=True,
+    )
+
+    def format_last_seen(entry: firebase_presence.PresenceEntry) -> str:
+        if not entry.last_seen_epoch:
+            return "never"
+        try:
+            from datetime import datetime, timezone
+
+            dt = datetime.fromtimestamp(entry.last_seen_epoch, tz=timezone.utc).astimezone()
+            return dt.strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            return entry.last_seen or "?"
+
+    def render_presence_rows(entries: list[firebase_presence.PresenceEntry]) -> None:
+        presence_list.controls.clear()
+        if not entries:
+            presence_list.controls.append(muted("No devices reporting yet."))
+            return
+        for entry in entries:
+            status = "Online" if entry.online else "Away"
+            status_color = "#2E7D32" if entry.online else "#9E9E9E"
+            user_bit = entry.username or "(not logged in)"
+            if entry.role:
+                user_bit = f"{user_bit} ({entry.role})"
+            suffix = " — this device" if entry.is_this_device else ""
+            presence_list.controls.append(
+                ft.Container(
+                    bgcolor="#FAFAFA",
+                    border=ft.Border.all(1, "#E0E0E0"),
+                    border_radius=6,
+                    padding=12,
+                    content=ft.Column(
+                        [
+                            ft.Row(
+                                [
+                                    ft.Text(
+                                        entry.device_label + suffix,
+                                        weight=ft.FontWeight.W_600,
+                                        font_family=FONT_FAMILY,
+                                        expand=True,
+                                    ),
+                                    ft.Text(
+                                        status,
+                                        color=status_color,
+                                        weight=ft.FontWeight.W_600,
+                                        font_family=FONT_FAMILY,
+                                    ),
+                                ]
+                            ),
+                            muted(f"User: {user_bit}"),
+                            muted(
+                                f"Last seen: {format_last_seen(entry)}"
+                                + (f" · v{entry.app_version}" if entry.app_version else "")
+                            ),
+                        ],
+                        spacing=4,
+                        tight=True,
+                    ),
+                )
+            )
+
+    def refresh_presence(_=None):
+        if not is_admin:
+            open_login_dialog()
+            return
+
+        def work():
+            try:
+                entries = firebase_presence.fetch_presence()
+
+                def apply():
+                    render_presence_rows(entries)
+                    presence_status.value = firebase_presence.presence_status_text()
+                    page.update()
+
+                apply()
+            except Exception as exc:
+                show_snack(f"Could not load online list: {exc}", error=True)
+
+        if not firebase_presence.is_configured():
+            presence_list.controls = [
+                muted("Firebase is not configured yet. Super Admin: use Firebase setup.")
+            ]
+            presence_status.value = firebase_presence.presence_status_text()
+            page.update()
+            return
+        show_snack("Refreshing online devices…")
+        page.run_thread(work)
+
+    def save_tablet_name(_=None):
+        if not is_admin:
+            open_login_dialog()
+            return
+        label = firebase_presence.set_device_label(tablet_name_field.value or "")
+        tablet_name_field.value = label
+        page.update()
+        show_snack(f"Tablet name set to “{label}”.")
+
+        def work():
+            try:
+                firebase_presence.publish_heartbeat(
+                    username=admin_username,
+                    role=admin_role,
+                    online=True,
+                )
+            except Exception:
+                pass
+
+        if firebase_presence.is_configured():
+            page.run_thread(work)
+
+    def open_firebase_setup(_=None):
+        if not is_super_admin:
+            show_snack("Only Super Admin can configure Firebase.", error=True)
+            return
+        cfg = firebase_presence.resolve_config()
+        api_key = ft.TextField(
+            label="Web API key",
+            value=cfg.get("api_key") or "",
+            dense=True,
+            password=True,
+            can_reveal_password=True,
+        )
+        database_url = ft.TextField(
+            label="Realtime Database URL",
+            value=cfg.get("database_url") or "",
+            dense=True,
+            hint_text="https://….firebasedatabase.app",
+        )
+        project_id = ft.TextField(
+            label="Project ID (optional)",
+            value=cfg.get("project_id") or "",
+            dense=True,
+        )
+
+        def close_dialog(_=None):
+            page.pop_dialog()
+
+        def save_cfg(_=None):
+            try:
+                firebase_presence.save_config(
+                    api_key=api_key.value or "",
+                    database_url=database_url.value or "",
+                    project_id=project_id.value or "",
+                )
+                page.pop_dialog()
+                presence_status.value = firebase_presence.presence_status_text()
+                page.update()
+                show_snack("Firebase settings saved.")
+                refresh_presence()
+            except Exception as exc:
+                show_snack(str(exc), error=True)
+
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Firebase setup"),
+                content=ft.Column(
+                    [
+                        muted(
+                            "Create a Firebase project once (see docs/FIREBASE_SETUP.md). "
+                            "Paste the Web API key and Realtime Database URL here. "
+                            "Also enable Anonymous Authentication and publish the presence rules."
+                        ),
+                        api_key,
+                        database_url,
+                        project_id,
+                    ],
+                    tight=True,
+                    spacing=10,
+                    width=440,
+                    height=360,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=close_dialog),
+                    ft.TextButton("Save", on_click=save_cfg),
+                ],
+            )
+        )
+
+    presence_controls: list[ft.Control] = [
+        presence_status,
+        ft.Row(
+            [
+                tablet_name_field,
+                ft.OutlinedButton(
+                    "Save name",
+                    height=MIN_TOUCH,
+                    disabled=not is_admin,
+                    on_click=save_tablet_name,
+                ),
+            ],
+            spacing=8,
+        ),
+        ft.Row(
+            [
+                ft.ElevatedButton(
+                    "Refresh",
+                    icon=ft.Icons.REFRESH,
+                    bgcolor=PRIMARY if is_admin else "#9E9E9E",
+                    color=ft.Colors.WHITE,
+                    height=MIN_TOUCH,
+                    disabled=not is_admin,
+                    on_click=refresh_presence,
+                ),
+            ],
+            spacing=12,
+            wrap=True,
+        ),
+        presence_list,
+    ]
+    if is_super_admin:
+        presence_controls.insert(
+            2,
+            ft.TextButton(
+                "Firebase setup…",
+                icon=ft.Icons.CLOUD,
+                on_click=open_firebase_setup,
+            ),
+        )
+
+    presence_section = _card(
+        "Who's online",
+        "See which tablets have the app open and which user is logged in. "
+        "Requires a one-time Firebase setup (Super Admin).",
+        *presence_controls,
+    )
+
     return ft.Container(
         content=ft.Column(
             [
                 section_title("Settings"),
-                muted("Accounts, barcode master list, and cloud sync configuration"),
+                muted("Accounts, barcode master list, cloud sync, and who's online"),
                 ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
                 accounts_section,
                 ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
@@ -1190,6 +1431,8 @@ def build(
                 cloud_section,
                 ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
                 auto_sync_section,
+                ft.Divider(height=16, color=ft.Colors.TRANSPARENT),
+                presence_section,
             ],
             scroll=ft.ScrollMode.AUTO,
             expand=True,

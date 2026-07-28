@@ -87,6 +87,7 @@ class ScannerApp:
         self.navigate("home")
         self._start_update_check()
         self._start_auto_sync_scheduler()
+        self._start_presence_scheduler()
 
     def _start_auto_sync_scheduler(self) -> None:
         from app import scheduled_sync
@@ -115,6 +116,34 @@ class ScannerApp:
             get_checker_username=lambda: self.admin_username,
             on_status=on_status,
         )
+
+    def _start_presence_scheduler(self) -> None:
+        from app import firebase_presence
+
+        firebase_presence.start_presence_scheduler(
+            get_user=lambda: (self.admin_username, self.admin_role),
+        )
+
+    def _publish_presence_now(self, *, online: bool = True) -> None:
+        from app import firebase_presence
+
+        if not firebase_presence.is_configured():
+            return
+
+        def work():
+            try:
+                firebase_presence.publish_heartbeat(
+                    username=self.admin_username,
+                    role=self.admin_role,
+                    online=online,
+                )
+            except Exception:
+                pass
+
+        try:
+            self.page.run_thread(work)
+        except Exception:
+            work()
 
     def _build_sidebar(self) -> ft.Container:
         self.nav_buttons = {
@@ -381,6 +410,9 @@ class ScannerApp:
             inner = btn.content
             inner.bgcolor = "#1E88E5" if active else "#42A5F5"
 
+        if view != "home":
+            self.page._home_dashboard_token = None
+
         if view == "home":
             self.page_body.content = home.build(
                 self.page,
@@ -488,6 +520,7 @@ class ScannerApp:
             self.admin_role = account.role
             self.page._session_username = account.username
             self.page._session_role = account.role
+            self._publish_presence_now(online=True)
             return True
         return False
 
@@ -507,6 +540,8 @@ class ScannerApp:
         self.admin_role = None
         self.page._session_username = None
         self.page._session_role = None
+        # Device stays open; clear logged-in user on the presence board.
+        self._publish_presence_now(online=True)
 
     def create_user(
         self,

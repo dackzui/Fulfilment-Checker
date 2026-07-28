@@ -27,8 +27,8 @@ org = "com.deks"
 product = "Picking Barcode Scanner"
 company = "DEKS"
 copyright = "Copyright (C) 2026 DEKS Industries Pty Ltd"
-build_version = "1.8.17"
-build_number = 33
+build_version = "1.8.18"
+build_number = 34
 
 [tool.flet.app]
 path = "."
@@ -40,6 +40,8 @@ exclude = [
     "data/admins.json",
     "data/cloud_credentials.json",
     "data/cloud_tokens",
+    "data/firebase_config.json",
+    "data/firebase_auth.json",
     "data/exports",
     "agent-tools",
 ]

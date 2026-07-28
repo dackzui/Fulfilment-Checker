@@ -6,7 +6,12 @@ data/admins.json
 data/config.json
 data/cloud_credentials.json
 data/cloud_tokens/
+data/firebase_config.json
+data/firebase_auth.json
+data/device_id.txt
 data/exports/
+data/scanner.db-shm
+data/scanner.db-wal
 data/dismissed_update.json
 data/startup_err.txt
 data/items.json
