@@ -216,10 +216,16 @@ def build(
             online_list.controls.append(muted("No tablets online right now."))
             return
         for entry in online:
-            user_bit = entry.username or "(not logged in)"
-            if entry.role:
-                user_bit = f"{user_bit} ({entry.role})"
-            suffix = " · this device" if entry.is_this_device else ""
+            user_name = entry.username or "(not logged in)"
+            role_bit = f" ({entry.role})" if entry.role else ""
+            device_bit = entry.device_label or "Device"
+            if entry.is_this_device:
+                device_bit = f"{device_bit} · this device"
+            picker_bit = (
+                f" · Picker: {entry.current_picker}"
+                if entry.current_picker
+                else ""
+            )
             online_list.controls.append(
                 ft.Container(
                     bgcolor="#F1F8E9",
@@ -232,13 +238,12 @@ def build(
                             ft.Column(
                                 [
                                     ft.Text(
-                                        f"{entry.device_label}{suffix}",
+                                        user_name,
                                         weight=ft.FontWeight.W_600,
                                         font_family=FONT_FAMILY,
                                     ),
                                     muted(
-                                        f"{user_bit} · today {entry.fulfilments_today} · "
-                                        f"total {entry.fulfilments_total}"
+                                        f"{device_bit}{role_bit}{picker_bit}"
                                     ),
                                 ],
                                 spacing=2,

@@ -23,6 +23,7 @@ from app.paths import get_data_dir
 CONFIG_FILE = "firebase_config.json"
 DEVICE_ID_FILE = "device_id.txt"
 DEVICE_LABEL_KEY = "device_label"
+DEFAULT_PICKER_KEY = "default_picker_name"
 AUTH_CACHE_FILE = "firebase_auth.json"
 
 HEARTBEAT_SECONDS = 30
@@ -45,6 +46,7 @@ class PresenceEntry:
     online: bool
     app_version: str
     is_this_device: bool = False
+    current_picker: str | None = None
     fulfilments_today: int = 0
     fulfilments_total: int = 0
     stats_today: dict[str, int] | None = None
@@ -131,6 +133,25 @@ def set_device_label(label: str) -> str:
     cleaned = (label or "").strip()[:60] or get_device_label()
     cfg = _load_json(_app_config_path())
     cfg[DEVICE_LABEL_KEY] = cleaned
+    _save_json(_app_config_path(), cfg)
+    return cleaned
+
+
+def get_default_picker() -> str:
+    cfg = _load_json(_app_config_path())
+    return str(cfg.get(DEFAULT_PICKER_KEY) or "").strip()
+
+
+def set_default_picker(name: str) -> str:
+    """Remember the picker used on New Scan until the user chooses another."""
+    from app.components import capitalize_person_name
+
+    cleaned = capitalize_person_name(name or "").strip()[:80]
+    cfg = _load_json(_app_config_path())
+    if cleaned:
+        cfg[DEFAULT_PICKER_KEY] = cleaned
+    elif DEFAULT_PICKER_KEY in cfg:
+        del cfg[DEFAULT_PICKER_KEY]
     _save_json(_app_config_path(), cfg)
     return cleaned
 
@@ -333,6 +354,7 @@ def publish_heartbeat(
         "device_label": get_device_label(),
         "username": (username or "").strip() or None,
         "role": (role or "").strip() or None,
+        "current_picker": get_default_picker() or None,
         "firebase_uid": uid,
         "online": bool(online),
         "last_seen": now.isoformat(),
@@ -425,6 +447,11 @@ def fetch_presence() -> list[PresenceEntry]:
                 online=flagged_online and recent,
                 app_version=str(row.get("app_version") or ""),
                 is_this_device=str(device_id) == this_id,
+                current_picker=(
+                    str(row["current_picker"]).strip()
+                    if row.get("current_picker")
+                    else None
+                ),
                 fulfilments_today=today_sum,
                 fulfilments_total=total_sum,
                 stats_today=today_map,

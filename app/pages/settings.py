@@ -1210,10 +1210,16 @@ def build(
         for entry in entries:
             status = "Online" if entry.online else "Away"
             status_color = "#2E7D32" if entry.online else "#9E9E9E"
-            user_bit = entry.username or "(not logged in)"
-            if entry.role:
-                user_bit = f"{user_bit} ({entry.role})"
-            suffix = " — this device" if entry.is_this_device else ""
+            user_name = entry.username or "(not logged in)"
+            role_bit = f" ({entry.role})" if entry.role else ""
+            device_bit = entry.device_label or "Device"
+            if entry.is_this_device:
+                device_bit = f"{device_bit} — this device"
+            picker_bit = (
+                f" · Picker: {entry.current_picker}"
+                if entry.current_picker
+                else ""
+            )
             presence_list.controls.append(
                 ft.Container(
                     bgcolor="#FAFAFA",
@@ -1225,7 +1231,7 @@ def build(
                             ft.Row(
                                 [
                                     ft.Text(
-                                        entry.device_label + suffix,
+                                        user_name,
                                         weight=ft.FontWeight.W_600,
                                         font_family=FONT_FAMILY,
                                         expand=True,
@@ -1238,7 +1244,7 @@ def build(
                                     ),
                                 ]
                             ),
-                            muted(f"User: {user_bit}"),
+                            muted(f"{device_bit}{role_bit}{picker_bit}"),
                             muted(
                                 f"Last seen: {format_last_seen(entry)}"
                                 + (f" · v{entry.app_version}" if entry.app_version else "")

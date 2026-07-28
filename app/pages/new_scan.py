@@ -126,12 +126,23 @@ def build(
         if not name:
             return
         database.remember_picker_name(name)
+        from app import firebase_presence
+
+        firebase_presence.set_default_picker(name)
         refresh_picker_options(keep_value=True)
 
     def on_picker_blur(_=None):
         if picker.value:
             picker.value = capitalize_person_name(picker.value)
         remember_picker_from_field()
+
+    def apply_default_picker():
+        from app import firebase_presence
+
+        default = firebase_presence.get_default_picker()
+        if default:
+            picker.value = default
+            refresh_picker_options(keep_value=True)
 
     def current_session() -> tuple[str | None, str | None]:
         if get_logged_in:
@@ -341,6 +352,7 @@ def build(
         )
 
     apply_logged_in_checker()
+    apply_default_picker()
     check_date = text_input(value=today, read_only=True, expand=False)
     check_date.width = 140
     check_time = text_input(value="", hint="On save", read_only=True, expand=False)
@@ -1181,6 +1193,7 @@ def build(
             session_id=draft_session_id,
             status="draft",
         )
+        remember_picker_from_field()
         refresh_picker_options()
         show_snack(f"Saved — resume later to enter No of Boxes (checking #{draft_session_id}).")
 
@@ -1190,6 +1203,7 @@ def build(
         draft_session_id = None
         clear_ticket()
         picker.value = ""
+        apply_default_picker()
         checker.value = ""
         apply_logged_in_checker()
         check_date.value = today
@@ -1226,6 +1240,7 @@ def build(
             session_id=draft_session_id,
             status="completed",
         )
+        remember_picker_from_field()
         show_snack(f"Scan completed — checking #{session_id} saved.")
         navigate("history", session_id=session_id)
 
