@@ -495,12 +495,18 @@ def _dashboard_settings_url() -> str:
     return f"{resolve_config()['database_url']}/dashboard_settings.json"
 
 
-def get_week_filter() -> str:
-    """Return ``this`` or ``last``. Falls back to this week."""
+def get_dashboard_settings() -> dict[str, Any]:
+    """Load shared dashboard settings (week filter, prize message, etc.)."""
+    local = _load_json(_app_config_path())
+    week = str(local.get("dashboard_week_filter") or "this").strip().lower()
+    prize = str(local.get("dashboard_prize_message") or "").strip()
+    settings = {
+        "week_filter": "last" if week == "last" else "this",
+        "prize_message": prize,
+        "updated_by": str(local.get("dashboard_settings_updated_by") or "").strip() or None,
+    }
     if not is_configured():
-        cfg = _load_json(_app_config_path())
-        value = str(cfg.get("dashboard_week_filter") or "this").strip().lower()
-        return "last" if value == "last" else "this"
+        return settings
     try:
         token = _ensure_id_token()
         resp = requests.get(
@@ -509,30 +515,53 @@ def get_week_filter() -> str:
             timeout=15,
         )
         if resp.status_code >= 400:
-            return "this"
+            return settings
         raw = resp.json() or {}
         if not isinstance(raw, dict):
-            return "this"
-        value = str(raw.get("week_filter") or "this").strip().lower()
-        return "last" if value == "last" else "this"
+            return settings
+        remote_week = str(raw.get("week_filter") or settings["week_filter"]).strip().lower()
+        settings["week_filter"] = "last" if remote_week == "last" else "this"
+        settings["prize_message"] = str(raw.get("prize_message") or "").strip()
+        settings["updated_by"] = (
+            str(raw.get("updated_by") or "").strip() or settings["updated_by"]
+        )
+        return settings
     except Exception:
-        return "this"
+        return settings
 
 
-def set_week_filter(which: str, *, updated_by: str | None = None) -> str:
-    """Persist week graph filter. Returns normalized ``this`` or ``last``."""
-    value = "last" if (which or "").strip().lower() == "last" else "this"
-    cfg = _load_json(_app_config_path())
-    cfg["dashboard_week_filter"] = value
-    _save_json(_app_config_path(), cfg)
+def save_dashboard_settings(
+    *,
+    week_filter: str | None = None,
+    prize_message: str | None = None,
+    updated_by: str | None = None,
+) -> dict[str, Any]:
+    """Merge and persist dashboard settings locally and to Firebase when configured."""
+    current = get_dashboard_settings()
+    if week_filter is not None:
+        current["week_filter"] = (
+            "last" if str(week_filter).strip().lower() == "last" else "this"
+        )
+    if prize_message is not None:
+        # Optional — empty string clears the message.
+        current["prize_message"] = str(prize_message).strip()[:280]
+    if updated_by is not None:
+        current["updated_by"] = (updated_by or "").strip() or None
+
+    local = _load_json(_app_config_path())
+    local["dashboard_week_filter"] = current["week_filter"]
+    local["dashboard_prize_message"] = current["prize_message"]
+    local["dashboard_settings_updated_by"] = current.get("updated_by") or ""
+    _save_json(_app_config_path(), local)
 
     if not is_configured():
-        return value
+        return current
 
     token = _ensure_id_token()
     payload = {
-        "week_filter": value,
-        "updated_by": (updated_by or "").strip() or None,
+        "week_filter": current["week_filter"],
+        "prize_message": current["prize_message"],
+        "updated_by": current.get("updated_by"),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "firebase_uid": _firebase_uid(),
     }
@@ -543,15 +572,37 @@ def set_week_filter(which: str, *, updated_by: str | None = None) -> str:
         timeout=15,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(_firebase_error(resp, "Could not save week filter"))
-    return value
+        raise RuntimeError(_firebase_error(resp, "Could not save dashboard settings"))
+    return current
+
+
+def get_week_filter() -> str:
+    """Return ``this`` or ``last``. Falls back to this week."""
+    return str(get_dashboard_settings().get("week_filter") or "this")
+
+
+def set_week_filter(which: str, *, updated_by: str | None = None) -> str:
+    """Persist week graph filter. Returns normalized ``this`` or ``last``."""
+    settings = save_dashboard_settings(week_filter=which, updated_by=updated_by)
+    return str(settings["week_filter"])
+
+
+def get_prize_message() -> str:
+    return str(get_dashboard_settings().get("prize_message") or "").strip()
+
+
+def set_prize_message(message: str, *, updated_by: str | None = None) -> str:
+    settings = save_dashboard_settings(prize_message=message, updated_by=updated_by)
+    return str(settings.get("prize_message") or "")
 
 
 def dashboard_snapshot() -> dict[str, Any]:
     """Presence + fulfilment rows for the Home dashboard."""
     from app import database
 
-    week_filter = get_week_filter()
+    settings = get_dashboard_settings()
+    week_filter = str(settings.get("week_filter") or "this")
+    prize_message = str(settings.get("prize_message") or "").strip()
     week_start, week_end = database.week_date_bounds(week_filter)
     if not is_configured():
         local = database.local_fulfilment_snapshot()
@@ -585,6 +636,7 @@ def dashboard_snapshot() -> dict[str, Any]:
             "week_filter": week_filter,
             "week_start": week_start.isoformat(),
             "week_end": week_end.isoformat(),
+            "prize_message": prize_message,
             "source": "local",
         }
 
@@ -601,6 +653,7 @@ def dashboard_snapshot() -> dict[str, Any]:
         "week_filter": week_filter,
         "week_start": week_start.isoformat(),
         "week_end": week_end.isoformat(),
+        "prize_message": prize_message,
         "source": "firebase",
     }
 

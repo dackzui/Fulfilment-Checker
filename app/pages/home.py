@@ -34,29 +34,38 @@ def _week_bar_chart(rows: list[tuple[str, int]]) -> ft.Control:
     max_count = max(count for _, count in rows) or 1
     bars: list[ft.Control] = []
     for index, (name, count) in enumerate(rows):
+        is_top = index == 0
         width_frac = max(0.06, count / max_count)
-        color = PRIMARY if index == 0 else _BAR_COLORS[index % len(_BAR_COLORS)]
+        color = "#F9A825" if is_top else _BAR_COLORS[index % len(_BAR_COLORS)]
+        label_controls: list[ft.Control] = []
+        if is_top:
+            label_controls.append(ft.Text("👑", size=16, font_family=FONT_FAMILY))
+        label_controls.append(
+            ft.Text(
+                name,
+                size=13,
+                weight=ft.FontWeight.W_600,
+                font_family=FONT_FAMILY,
+                expand=True,
+                color="#F57F17" if is_top else TEXT,
+            )
+        )
+        label_controls.append(
+            ft.Text(
+                str(count),
+                size=13,
+                weight=ft.FontWeight.W_600,
+                font_family=FONT_FAMILY,
+                color=PRIMARY if is_top else TEXT,
+            )
+        )
         bars.append(
             ft.Column(
                 [
                     ft.Row(
-                        [
-                            ft.Text(
-                                name,
-                                size=13,
-                                weight=ft.FontWeight.W_600 if index == 0 else None,
-                                font_family=FONT_FAMILY,
-                                expand=True,
-                            ),
-                            ft.Text(
-                                str(count),
-                                size=13,
-                                weight=ft.FontWeight.W_600,
-                                font_family=FONT_FAMILY,
-                                color=PRIMARY if index == 0 else TEXT,
-                            ),
-                        ],
+                        label_controls,
                         spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     ft.Container(
                         content=ft.Container(
@@ -315,6 +324,8 @@ def build(
     def render_week_chart(
         rows: list[firebase_presence.UserFulfilmentRow],
         which: str,
+        *,
+        prize_message: str = "",
     ) -> None:
         week_chart_host.controls.clear()
         ranked: list[tuple[str, int]] = []
@@ -323,10 +334,42 @@ def build(
             if count > 0:
                 ranked.append((row.picker_name, int(count)))
         ranked.sort(key=lambda item: (-item[1], item[0].lower()))
+        top_name = ranked[0][0] if ranked else None
+        prize = (prize_message or "").strip()
+        if prize:
+            who = top_name or "the top picker"
+            week_chart_host.controls.append(
+                ft.Container(
+                    bgcolor="#FFF8E1",
+                    border=ft.Border.all(1, "#FFD54F"),
+                    border_radius=8,
+                    padding=12,
+                    content=ft.Row(
+                        [
+                            ft.Text("👑", size=20),
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        f"Prize for {who}",
+                                        weight=ft.FontWeight.W_600,
+                                        font_family=FONT_FAMILY,
+                                    ),
+                                    muted(prize),
+                                ],
+                                spacing=2,
+                                tight=True,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=10,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                )
+            )
         if ranked:
             top_name, top_count = ranked[0]
             week_chart_host.controls.append(
-                muted(f"Most this period: {top_name} ({top_count})")
+                muted(f"👑 Most this period: {top_name} ({top_count})")
             )
         week_chart_host.controls.append(_week_bar_chart(ranked[:12]))
 
@@ -346,7 +389,11 @@ def build(
         )
         label = "Last week" if which == "last" else "This week"
         week_range_label.value = f"{label}: {range_text}" if range_text else label
-        render_week_chart(fulfilments, which)
+        render_week_chart(
+            fulfilments,
+            which,
+            prize_message=str(snap.get("prize_message") or ""),
+        )
         if snap.get("configured"):
             dash_status.value = (
                 f"Live from Firebase · refreshes every {_DASHBOARD_REFRESH_SECONDS}s · "

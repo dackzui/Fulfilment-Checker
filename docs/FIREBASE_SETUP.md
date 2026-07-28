@@ -74,7 +74,7 @@ You can always find them later under **Project settings** (gear) → **Your apps
 Meaning:
 - only signed-in app devices can read the online list
 - a device can only update its own presence row
-- `dashboard_settings` stores the Home week-graph filter (This week / Last week). Only Super Admin should change it in the app UI.
+- `dashboard_settings` stores the Home week-graph filter (This week / Last week) and optional prize message for the top picker. Only Super Admin should change these in the app / monitor UI.
 
 ---
 
