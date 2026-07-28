@@ -118,8 +118,12 @@ def build(
         ]
         if current:
             picker.value = current
-        if picker.page is not None:
-            picker.update()
+        # Only update after the dropdown is on the page (avoids Flet startup crash).
+        try:
+            if picker.page is not None:
+                picker.update()
+        except Exception:
+            pass
 
     def remember_picker_from_field():
         name = capitalize_person_name(picker.value or "").strip()
@@ -140,9 +144,10 @@ def build(
         from app import firebase_presence
 
         default = firebase_presence.get_default_picker()
-        if default:
-            picker.value = default
-            refresh_picker_options(keep_value=True)
+        if not default:
+            return
+        picker.value = default
+        refresh_picker_options(keep_value=True)
 
     def current_session() -> tuple[str | None, str | None]:
         if get_logged_in:
@@ -352,7 +357,6 @@ def build(
         )
 
     apply_logged_in_checker()
-    apply_default_picker()
     check_date = text_input(value=today, read_only=True, expand=False)
     check_date.width = 140
     check_time = text_input(value="", hint="On save", read_only=True, expand=False)
@@ -1576,6 +1580,7 @@ def build(
         if resume_session_id:
             load_draft(resume_session_id)
         else:
+            apply_default_picker()
             refresh_verification_status()
         update_picker_manage_visibility()
         if not session_is_logged_in():
