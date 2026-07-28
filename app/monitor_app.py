@@ -41,6 +41,37 @@ def _ranked_pickers(
     return ranked
 
 
+def _online_pickers(
+    presence: list[firebase_presence.PresenceEntry],
+) -> list[dict[str, object]]:
+    """Pickers with today's completed pickups on tablets that are currently online."""
+    by_name: dict[str, dict[str, object]] = {}
+    for entry in presence:
+        if not entry.online:
+            continue
+        for name, count in (entry.stats_today or {}).items():
+            try:
+                qty = int(count)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            row = by_name.setdefault(
+                name,
+                {"picker_name": name, "today": 0, "devices": []},
+            )
+            row["today"] = int(row["today"]) + qty
+            devices = row["devices"]
+            assert isinstance(devices, list)
+            if entry.device_label and entry.device_label not in devices:
+                devices.append(entry.device_label)
+    rows = list(by_name.values())
+    rows.sort(
+        key=lambda item: (-int(item["today"]), str(item["picker_name"]).lower())
+    )
+    return rows
+
+
 def _monitor_bar_chart(rows: list[tuple[str, int]]) -> ft.Control:
     if not rows:
         return muted("No pickups recorded for this period yet.")
@@ -53,9 +84,7 @@ def _monitor_bar_chart(rows: list[tuple[str, int]]) -> ft.Control:
         color = "#F9A825" if is_top else _BAR_COLORS[index % len(_BAR_COLORS)]
         name_row: list[ft.Control] = []
         if is_top:
-            name_row.append(
-                ft.Text(_CROWN, size=22, font_family=FONT_FAMILY)
-            )
+            name_row.append(ft.Text(_CROWN, size=22, font_family=FONT_FAMILY))
         name_row.append(
             ft.Text(
                 name,
@@ -83,7 +112,11 @@ def _monitor_bar_chart(rows: list[tuple[str, int]]) -> ft.Control:
                 padding=16,
                 content=ft.Column(
                     [
-                        ft.Row(name_row, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                        ft.Row(
+                            name_row,
+                            spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
                         ft.Container(
                             content=ft.Container(
                                 bgcolor=color,
@@ -119,7 +152,7 @@ async def main(page: ft.Page):
     page.window.min_width = 900
     page.window.min_height = 640
 
-    session = {"username": None}
+    session = {"username": None, "view": "board"}
     body = ft.Container(expand=True, padding=28)
     page.add(body)
 
@@ -156,7 +189,8 @@ async def main(page: ft.Page):
                 page.update()
                 return
             session["username"] = account.username
-            show_monitor()
+            session["view"] = "board"
+            show_shell()
 
         return ft.Container(
             expand=True,
@@ -199,23 +233,25 @@ async def main(page: ft.Page):
         body.content = build_login()
         page.update()
 
-    def show_monitor():
+    def show_shell():
         stop_refresh()
         admin_name = session["username"] or ""
+        content_host = ft.Container(expand=True)
 
         title = ft.Text(
             "Top Pickers",
-            size=32,
+            size=28,
             weight=ft.FontWeight.BOLD,
             font_family=FONT_FAMILY,
         )
-        subtitle = muted("Live ranking for monitoring — refreshes automatically.")
-        range_label = muted("Week: —")
         status_label = muted("Loading…")
+
+        # --- Board controls ---
+        range_label = muted("Week: —")
         prize_banner = ft.Container(visible=False)
         chart_host = ft.Column(spacing=12, tight=True)
+        online_pickers_list = ft.Column(spacing=8, tight=True)
         top_label = ft.Text("", size=20, weight=ft.FontWeight.W_600, font_family=FONT_FAMILY)
-
         week_dropdown = ft.Dropdown(
             label="Week filter",
             width=220,
@@ -225,16 +261,28 @@ async def main(page: ft.Page):
                 ft.DropdownOption(key="last", text="Last week"),
             ],
         )
+
+        # --- Settings controls ---
         prize_field = ft.TextField(
             label="Prize message (optional)",
             hint_text="e.g. Top picker wins a $50 voucher this week",
             multiline=True,
-            min_lines=2,
-            max_lines=3,
-            expand=True,
+            min_lines=3,
+            max_lines=4,
+            width=560,
         )
+        settings_week_dropdown = ft.Dropdown(
+            label="Week filter",
+            width=220,
+            value="this",
+            options=[
+                ft.DropdownOption(key="this", text="This week"),
+                ft.DropdownOption(key="last", text="Last week"),
+            ],
+        )
+        settings_status = muted("")
 
-        filter_state = {"value": "this"}
+        filter_state = {"value": "this", "prize": ""}
         refresh_token = time.time()
         page._monitor_token = refresh_token
 
@@ -274,12 +322,60 @@ async def main(page: ft.Page):
                 ),
             )
 
+        def render_online_pickers(presence: list[firebase_presence.PresenceEntry]) -> None:
+            online_pickers_list.controls.clear()
+            rows = _online_pickers(presence)
+            if not rows:
+                online_pickers_list.controls.append(
+                    muted("No pickers with today’s pickups on online tablets right now.")
+                )
+                return
+            for row in rows:
+                devices = row.get("devices") or []
+                device_bit = (
+                    f" · {', '.join(str(d) for d in devices)}" if devices else ""
+                )
+                online_pickers_list.controls.append(
+                    ft.Container(
+                        bgcolor="#F1F8E9",
+                        border=ft.Border.all(1, "#C8E6C9"),
+                        border_radius=8,
+                        padding=12,
+                        content=ft.Row(
+                            [
+                                ft.Icon(ft.Icons.CIRCLE, color="#2E7D32", size=12),
+                                ft.Column(
+                                    [
+                                        ft.Text(
+                                            str(row["picker_name"]),
+                                            weight=ft.FontWeight.W_600,
+                                            font_family=FONT_FAMILY,
+                                        ),
+                                        muted(f"Today: {row['today']} pickup(s){device_bit}"),
+                                    ],
+                                    spacing=2,
+                                    tight=True,
+                                    expand=True,
+                                ),
+                            ],
+                            spacing=10,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                    )
+                )
+
         def apply_snapshot(snap: dict) -> None:
             which = str(snap.get("week_filter") or filter_state["value"] or "this")
+            prize = str(snap.get("prize_message") or "")
             filter_state["value"] = which
+            filter_state["prize"] = prize
             if week_dropdown.value != which:
                 week_dropdown.value = which
-            prize_field.value = str(snap.get("prize_message") or "")
+            if settings_week_dropdown.value != which:
+                settings_week_dropdown.value = which
+            if prize_field.value != prize:
+                prize_field.value = prize
+
             range_text = _format_iso_range(
                 str(snap.get("week_start") or ""),
                 str(snap.get("week_end") or ""),
@@ -292,10 +388,12 @@ async def main(page: ft.Page):
             if ranked:
                 top_name, top_count = ranked[0]
                 top_label.value = f"{_CROWN}  #1 {top_name}  —  {top_count} pickups"
-                render_prize_banner(str(snap.get("prize_message") or ""), top_name)
+                render_prize_banner(prize, top_name)
             else:
                 top_label.value = "No pickups yet for this period"
-                render_prize_banner(str(snap.get("prize_message") or ""), None)
+                render_prize_banner(prize, None)
+
+            render_online_pickers(list(snap.get("presence") or []))
 
             if snap.get("configured"):
                 status_label.value = (
@@ -339,10 +437,8 @@ async def main(page: ft.Page):
 
             page.run_thread(work)
 
-        def on_week_change(e):
-            chosen = (e.control.value or "this").strip().lower()
-            if chosen not in ("this", "last"):
-                chosen = "this"
+        def save_week_filter(chosen: str):
+            chosen = "last" if chosen == "last" else "this"
 
             def work():
                 try:
@@ -364,6 +460,12 @@ async def main(page: ft.Page):
 
             page.run_thread(work)
 
+        def on_week_change(e):
+            save_week_filter((e.control.value or "this").strip().lower())
+
+        def on_settings_week_change(e):
+            save_week_filter((e.control.value or "this").strip().lower())
+
         def save_prize(_=None):
             def work():
                 try:
@@ -375,6 +477,7 @@ async def main(page: ft.Page):
 
                     def apply():
                         apply_snapshot(snap)
+                        settings_status.value = "Prize message saved."
                         show_snack("Prize message saved.")
                         page.update()
 
@@ -394,7 +497,142 @@ async def main(page: ft.Page):
             session["username"] = None
             show_login()
 
+        def open_board(_=None):
+            session["view"] = "board"
+            render_view()
+
+        def open_settings(_=None):
+            session["view"] = "settings"
+            settings_status.value = (
+                "Prize message is optional. Leave blank to hide it on the board and tablets."
+            )
+            prize_field.value = filter_state.get("prize") or ""
+            settings_week_dropdown.value = filter_state.get("value") or "this"
+            render_view()
+
         week_dropdown.on_change = on_week_change
+        settings_week_dropdown.on_change = on_settings_week_change
+
+        def board_view() -> ft.Control:
+            return ft.Column(
+                [
+                    top_label,
+                    prize_banner,
+                    ft.Row(
+                        [range_label, week_dropdown],
+                        spacing=16,
+                        wrap=True,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Divider(height=8, color=ft.Colors.TRANSPARENT),
+                    ft.Text(
+                        "Online pickers",
+                        size=18,
+                        weight=ft.FontWeight.W_600,
+                        font_family=FONT_FAMILY,
+                    ),
+                    muted(
+                        "Pickers with completed pickups today on tablets that are currently online."
+                    ),
+                    online_pickers_list,
+                    ft.Divider(height=12, color=ft.Colors.TRANSPARENT),
+                    ft.Text(
+                        "Pickup leaderboard",
+                        size=18,
+                        weight=ft.FontWeight.W_600,
+                        font_family=FONT_FAMILY,
+                    ),
+                    ft.Container(content=chart_host, expand=True),
+                ],
+                expand=True,
+                scroll=ft.ScrollMode.AUTO,
+                spacing=10,
+            )
+
+        def settings_view() -> ft.Control:
+            return ft.Column(
+                [
+                    ft.Text(
+                        "Monitor settings",
+                        size=22,
+                        weight=ft.FontWeight.BOLD,
+                        font_family=FONT_FAMILY,
+                    ),
+                    muted("Only Super Admin can change these. Changes sync to all tablets."),
+                    ft.Divider(height=8, color=ft.Colors.TRANSPARENT),
+                    ft.Container(
+                        bgcolor=ft.Colors.WHITE,
+                        border_radius=10,
+                        padding=20,
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    "Week filter",
+                                    weight=ft.FontWeight.W_600,
+                                    font_family=FONT_FAMILY,
+                                ),
+                                muted("Controls the leaderboard period on the board and Home."),
+                                settings_week_dropdown,
+                            ],
+                            spacing=10,
+                            tight=True,
+                        ),
+                    ),
+                    ft.Container(
+                        bgcolor=ft.Colors.WHITE,
+                        border_radius=10,
+                        padding=20,
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    "Prize for #1 (optional)",
+                                    weight=ft.FontWeight.W_600,
+                                    font_family=FONT_FAMILY,
+                                ),
+                                muted(
+                                    "Shown on the board under the crown winner, and on tablet Home. "
+                                    "Leave blank for no prize message."
+                                ),
+                                prize_field,
+                                ft.Row(
+                                    [
+                                        ft.ElevatedButton(
+                                            "Save prize",
+                                            bgcolor=PRIMARY,
+                                            color=ft.Colors.WHITE,
+                                            height=48,
+                                            on_click=save_prize,
+                                        ),
+                                        ft.OutlinedButton(
+                                            "Clear prize",
+                                            height=48,
+                                            on_click=clear_prize,
+                                        ),
+                                    ],
+                                    spacing=10,
+                                ),
+                                settings_status,
+                            ],
+                            spacing=10,
+                            tight=True,
+                        ),
+                    ),
+                    ft.TextButton(
+                        "← Back to board",
+                        icon=ft.Icons.ARROW_BACK,
+                        on_click=open_board,
+                    ),
+                ],
+                expand=True,
+                scroll=ft.ScrollMode.AUTO,
+                spacing=14,
+            )
+
+        def render_view():
+            content_host.content = (
+                settings_view() if session.get("view") == "settings" else board_view()
+            )
+            page.update()
 
         def auto_loop():
             while getattr(page, "_monitor_token", None) == refresh_token:
@@ -438,79 +676,36 @@ async def main(page: ft.Page):
                 ft.Row(
                     [
                         ft.Image(src=logo_src(), width=140, fit=ft.BoxFit.CONTAIN),
-                        ft.Column([title, subtitle], spacing=4, expand=True),
-                        ft.OutlinedButton("Refresh", icon=ft.Icons.REFRESH, on_click=refresh_now),
+                        ft.Column(
+                            [
+                                title,
+                                muted("Live ranking for monitoring — refreshes automatically."),
+                            ],
+                            spacing=4,
+                            expand=True,
+                        ),
+                        ft.OutlinedButton(
+                            "Refresh",
+                            icon=ft.Icons.REFRESH,
+                            on_click=refresh_now,
+                        ),
+                        ft.OutlinedButton(
+                            "Settings",
+                            icon=ft.Icons.SETTINGS,
+                            on_click=open_settings,
+                        ),
                         ft.TextButton("Sign out", on_click=logout),
                     ],
-                    spacing=16,
+                    spacing=12,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
                 status_label,
                 ft.Divider(height=8, color=ft.Colors.TRANSPARENT),
-                ft.Row(
-                    [
-                        range_label,
-                        week_dropdown,
-                    ],
-                    spacing=16,
-                    wrap=True,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-                top_label,
-                prize_banner,
-                ft.Container(
-                    content=ft.Column(
-                        [
-                            ft.Text(
-                                "Prize for #1 (optional)",
-                                weight=ft.FontWeight.W_600,
-                                font_family=FONT_FAMILY,
-                            ),
-                            muted(
-                                "Leave blank for no prize message. Saved for all tablets/monitors."
-                            ),
-                            ft.Row(
-                                [
-                                    prize_field,
-                                    ft.ElevatedButton(
-                                        "Save prize",
-                                        bgcolor=PRIMARY,
-                                        color=ft.Colors.WHITE,
-                                        height=48,
-                                        on_click=save_prize,
-                                    ),
-                                    ft.OutlinedButton(
-                                        "Clear",
-                                        height=48,
-                                        on_click=clear_prize,
-                                    ),
-                                ],
-                                spacing=10,
-                            ),
-                        ],
-                        spacing=8,
-                        tight=True,
-                    ),
-                    bgcolor=ft.Colors.WHITE,
-                    border_radius=10,
-                    padding=16,
-                ),
-                ft.Divider(height=12, color=ft.Colors.TRANSPARENT),
-                ft.Text(
-                    "Pickup leaderboard",
-                    size=18,
-                    weight=ft.FontWeight.W_600,
-                    font_family=FONT_FAMILY,
-                ),
-                ft.Container(
-                    content=chart_host,
-                    expand=True,
-                ),
+                content_host,
             ],
             expand=True,
-            scroll=ft.ScrollMode.AUTO,
-            spacing=10,
+            spacing=8,
         )
-        page.update()
+        render_view()
 
     show_login()
