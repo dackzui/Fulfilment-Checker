@@ -94,6 +94,19 @@ function Build-Monitor {
 
     New-Item -ItemType Directory -Force -Path $distRoot | Out-Null
 
+    # Stop a running Monitor so PyInstaller can overwrite files.
+    Get-Process -Name $appName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
+    # Clear intermediate work dir (do not run EXEs from here).
+    $workDir = Join-Path $root "build\$appName"
+    if (Test-Path $workDir) {
+        Remove-Item $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $builtDir) {
+        Remove-Item $builtDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     Write-Host ""
     Write-Host "Building $productName v$version ..." -ForegroundColor Cyan
     Write-Host "This may take a few minutes the first time." -ForegroundColor DarkGray
@@ -141,11 +154,37 @@ function Build-Monitor {
     # Writable data folder beside the EXE (admins, firebase config, session, DB).
     $dataBeside = Join-Path $builtDir "data"
     New-Item -ItemType Directory -Force -Path $dataBeside | Out-Null
-    foreach ($seed in @("deks_logo.png", "BarcodeMasterList.xlsx", "config.json.example", "firebase_config.json.example", "admins.json.example")) {
+    foreach ($seed in @(
+        "deks_logo.png",
+        "BarcodeMasterList.xlsx",
+        "config.json",
+        "config.json.example",
+        "firebase_config.json",
+        "firebase_config.json.example",
+        "admins.json",
+        "admins.json.example"
+    )) {
         $src = Join-Path $root "data\$seed"
         if (Test-Path $src) {
             Copy-Item $src (Join-Path $dataBeside (Split-Path $seed -Leaf)) -Force
         }
+    }
+
+    # Shared per-user data used by the packaged EXE (keeps Firebase across rebuilds).
+    $sharedData = Join-Path $env:LOCALAPPDATA "DEKS\picker-check\data"
+    New-Item -ItemType Directory -Force -Path $sharedData | Out-Null
+    foreach ($seed in @("firebase_config.json", "config.json", "admins.json", "deks_logo.png")) {
+        $src = Join-Path $root "data\$seed"
+        $dest = Join-Path $sharedData $seed
+        if ((Test-Path $src) -and -not (Test-Path $dest)) {
+            Copy-Item $src $dest -Force
+        }
+    }
+    # Always refresh Firebase keys from the project when rebuilding locally.
+    $fbSrc = Join-Path $root "data\firebase_config.json"
+    if (Test-Path $fbSrc) {
+        Copy-Item $fbSrc (Join-Path $sharedData "firebase_config.json") -Force
+        Copy-Item $fbSrc (Join-Path $dataBeside "firebase_config.json") -Force
     }
 
     # Convenience launcher next to the build folder.
@@ -153,13 +192,39 @@ function Build-Monitor {
     @"
 @echo off
 cd /d "%~dp0$appName"
+REM Prefer the project data folder when this build still lives under the repo.
+set "REPO_DATA=%~dp0..\..\data"
+if exist "%REPO_DATA%\firebase_config.json" (
+  set "PICKER_CHECK_DATA=%REPO_DATA%"
+  set "PICKER_CHECK_SOURCE_DATA=%REPO_DATA%"
+)
 start "" "%~dp0$appName\$exeName"
 "@ | Set-Content -Path $launcher -Encoding ASCII
+
+    # PyInstaller also leaves an incomplete EXE under build\ — that path has no
+    # _internal\python*.dll and fails if opened. Remove it so it cannot be clicked by mistake.
+    $workExe = Join-Path $root "build\$appName\$exeName"
+    if (Test-Path $workExe) {
+        Remove-Item $workExe -Force -ErrorAction SilentlyContinue
+    }
+    $workNote = Join-Path $root "build\$appName\DO_NOT_RUN_HERE.txt"
+    @"
+This folder is PyInstaller work files only.
+
+Run the Monitor from:
+  dist\monitor\DEKSTopPickersMonitor\DEKSTopPickersMonitor.exe
+or double-click:
+  dist\monitor\Run Monitor.bat
+or use the Desktop shortcut after: build-monitor.bat
+"@ | Set-Content -Path $workNote -Encoding ASCII
 
     Write-Host ""
     Write-Host "Build complete:" -ForegroundColor Green
     Write-Host "  $exe"
     Write-Host "  $launcher"
+    Write-Host ""
+    Write-Host "Do NOT open build\$appName\$exeName (incomplete)." -ForegroundColor Yellow
+    Write-Host "Use dist\monitor\Run Monitor.bat instead." -ForegroundColor Yellow
 }
 
 function New-Shortcut {
@@ -224,7 +289,8 @@ pause
     Write-Host "  Start:    $startLnk"
     Write-Host ""
     Write-Host "Sign in as Super Admin or Monitor Viewer." -ForegroundColor DarkGray
-    Write-Host "Copy data\firebase_config.json into the install data folder if Who's online is used." -ForegroundColor DarkGray
+    Write-Host "Firebase config is loaded from %LOCALAPPDATA%\DEKS\picker-check\data" -ForegroundColor DarkGray
+    Write-Host "  (seeded from this project's data\firebase_config.json on build)." -ForegroundColor DarkGray
 }
 
 if ($InstallOnly) {

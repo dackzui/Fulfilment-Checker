@@ -157,7 +157,14 @@ def build(
                     role=role_field.value or auth.ROLE_PICKER,
                 )
                 page.pop_dialog()
-                show_snack(f"User added — {account.username} ({account.role_label}).")
+                show_snack(
+                    f"User added — {account.username} ({account.role_label}). "
+                    "Synced to Firebase."
+                )
+                navigate("settings")
+            except RuntimeError as exc:
+                page.pop_dialog()
+                show_snack(str(exc), error=True)
                 navigate("settings")
             except (ValueError, PermissionError) as exc:
                 show_snack(str(exc), error=True)

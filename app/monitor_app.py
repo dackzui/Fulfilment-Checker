@@ -198,6 +198,10 @@ async def main(page: ft.Page):
             session["username"] = account.username
             session["role"] = account.role
             session["view"] = "board"
+            try:
+                auth.save_persisted_session(account.username, account.role)
+            except Exception:
+                pass
             show_shell()
 
         return ft.Container(
@@ -219,7 +223,8 @@ async def main(page: ft.Page):
                         ),
                         muted(
                             "Desktop board for weekly pickup rankings. "
-                            "Monitor Viewers can watch only; Super Admin can change settings."
+                            "Monitor Viewers can watch only; Super Admin can change settings "
+                            "and add users."
                         ),
                         username_field,
                         password_field,
@@ -529,6 +534,10 @@ async def main(page: ft.Page):
             stop_refresh()
             session["username"] = None
             session["role"] = None
+            try:
+                auth.clear_persisted_session()
+            except Exception:
+                pass
             show_login()
 
         def open_board(_=None):
@@ -545,7 +554,345 @@ async def main(page: ft.Page):
             )
             prize_field.value = filter_state.get("prize") or ""
             settings_week_dropdown.value = filter_state.get("value") or "this"
+            try:
+                auth.sync_with_cloud(force=False)
+            except Exception:
+                pass
             render_view()
+
+        def open_add_user_dialog(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can add users.", error=True)
+                return
+            username_field = ft.TextField(label="Username", autofocus=True)
+            password_field = ft.TextField(
+                label="Password",
+                password=True,
+                can_reveal_password=True,
+            )
+            role_field = ft.Dropdown(
+                label="Role",
+                value=auth.ROLE_PICKER,
+                options=[
+                    ft.dropdown.Option(auth.ROLE_PICKER, "Picker"),
+                    ft.dropdown.Option(auth.ROLE_ADMIN, "Admin"),
+                    ft.dropdown.Option(auth.ROLE_MONITOR_VIEWER, "Monitor Viewer"),
+                ],
+                width=320,
+            )
+
+            def close_dialog(_=None):
+                page.pop_dialog()
+
+            def submit_create(_=None):
+                try:
+                    account = auth.create_user(
+                        admin_name,
+                        (username_field.value or "").strip(),
+                        password_field.value or "",
+                        role=role_field.value or auth.ROLE_PICKER,
+                    )
+                    page.pop_dialog()
+                    show_snack(
+                        f"User added — {account.username} ({account.role_label}). "
+                        "Synced to Firebase for all tablets."
+                    )
+                    render_view()
+                except RuntimeError as exc:
+                    page.pop_dialog()
+                    show_snack(str(exc), error=True)
+                    render_view()
+                except (ValueError, PermissionError) as exc:
+                    show_snack(str(exc), error=True)
+
+            password_field.on_submit = submit_create
+            page.show_dialog(
+                ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Add User / Picker"),
+                    content=ft.Column(
+                        [
+                            muted(
+                                "Pickers appear in the New Scan picker list on all tablets."
+                            ),
+                            username_field,
+                            password_field,
+                            role_field,
+                        ],
+                        tight=True,
+                        spacing=12,
+                        width=320,
+                    ),
+                    actions=[
+                        ft.TextButton("Cancel", on_click=close_dialog),
+                        ft.TextButton("Add", on_click=submit_create),
+                    ],
+                )
+            )
+
+        def open_set_password_dialog(target_username: str):
+            new_field = ft.TextField(
+                label="New password",
+                password=True,
+                can_reveal_password=True,
+                autofocus=True,
+            )
+            confirm_field = ft.TextField(
+                label="Confirm new password",
+                password=True,
+                can_reveal_password=True,
+            )
+
+            def close_dialog(_=None):
+                page.pop_dialog()
+
+            def submit_set(_=None):
+                if (new_field.value or "") != (confirm_field.value or ""):
+                    show_snack("Passwords do not match.", error=True)
+                    return
+                try:
+                    auth.set_user_password(
+                        admin_name, target_username, new_field.value or ""
+                    )
+                    page.pop_dialog()
+                    show_snack(f"Password set for {target_username}.")
+                except (ValueError, PermissionError) as exc:
+                    show_snack(str(exc), error=True)
+
+            confirm_field.on_submit = submit_set
+            page.show_dialog(
+                ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Set Password"),
+                    content=ft.Column(
+                        [
+                            muted(f"Set the password for {target_username}."),
+                            new_field,
+                            confirm_field,
+                        ],
+                        tight=True,
+                        spacing=12,
+                        width=320,
+                    ),
+                    actions=[
+                        ft.TextButton("Cancel", on_click=close_dialog),
+                        ft.TextButton("Save", on_click=submit_set),
+                    ],
+                )
+            )
+
+        def open_set_role_dialog(target_username: str, current_role: str):
+            if current_role == auth.ROLE_SUPER_ADMIN:
+                show_snack("Super Admin role cannot be changed here.", error=True)
+                return
+            role_field = ft.Dropdown(
+                label="Role",
+                value=current_role if current_role != "checker" else auth.ROLE_PICKER,
+                options=[
+                    ft.dropdown.Option(auth.ROLE_PICKER, "Picker"),
+                    ft.dropdown.Option(auth.ROLE_ADMIN, "Admin"),
+                    ft.dropdown.Option(auth.ROLE_MONITOR_VIEWER, "Monitor Viewer"),
+                ],
+                width=320,
+            )
+
+            def close_dialog(_=None):
+                page.pop_dialog()
+
+            def submit_role(_=None):
+                try:
+                    account = auth.set_user_role(
+                        admin_name,
+                        target_username,
+                        role_field.value or auth.ROLE_PICKER,
+                    )
+                    page.pop_dialog()
+                    show_snack(
+                        f"Role updated — {account.username} is now {account.role_label}."
+                    )
+                    render_view()
+                except (ValueError, PermissionError) as exc:
+                    show_snack(str(exc), error=True)
+
+            page.show_dialog(
+                ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Change Role"),
+                    content=ft.Column(
+                        [muted(f"Change role for {target_username}."), role_field],
+                        tight=True,
+                        spacing=12,
+                        width=320,
+                    ),
+                    actions=[
+                        ft.TextButton("Cancel", on_click=close_dialog),
+                        ft.TextButton("Save", on_click=submit_role),
+                    ],
+                )
+            )
+
+        def confirm_delete_user(target_username: str):
+            def close_dialog(_=None):
+                page.pop_dialog()
+
+            def submit_delete(_=None):
+                try:
+                    auth.delete_admin(admin_name, target_username)
+                    page.pop_dialog()
+                    show_snack(f"Deleted user — {target_username}.")
+                    render_view()
+                except (ValueError, PermissionError) as exc:
+                    show_snack(str(exc), error=True)
+
+            page.show_dialog(
+                ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Delete User"),
+                    content=ft.Text(
+                        f"Delete the account '{target_username}'? This cannot be undone.",
+                        font_family=FONT_FAMILY,
+                    ),
+                    actions=[
+                        ft.TextButton("Cancel", on_click=close_dialog),
+                        ft.TextButton("Delete", on_click=submit_delete),
+                    ],
+                )
+            )
+
+        def sync_users_now(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can sync users.", error=True)
+                return
+
+            def work():
+                try:
+                    auth.sync_with_cloud(force=True)
+                    published, err = auth.push_all_users_to_cloud()
+
+                    def done():
+                        if err:
+                            show_snack(
+                                f"Firebase sync failed: {err}",
+                                error=True,
+                            )
+                        else:
+                            show_snack(
+                                f"Synced {published} user(s) to Firebase for all tablets."
+                            )
+                        render_view()
+
+                    done()
+                except Exception as exc:
+                    show_snack(f"Firebase sync failed: {exc}", error=True)
+
+            page.run_thread(work)
+
+        def users_section() -> ft.Control:
+            account_rows = ft.Column(spacing=4)
+            try:
+                accounts = auth.list_admin_accounts(admin_name)
+            except PermissionError:
+                accounts = []
+
+            if not accounts:
+                account_rows.controls.append(muted("No users yet."))
+            for account in accounts:
+                trailing_actions = [
+                    ft.IconButton(
+                        icon=ft.Icons.KEY,
+                        icon_color=PRIMARY,
+                        tooltip="Set password",
+                        on_click=lambda _, name=account.username: open_set_password_dialog(
+                            name
+                        ),
+                    ),
+                ]
+                if account.role != auth.ROLE_SUPER_ADMIN:
+                    trailing_actions.insert(
+                        0,
+                        ft.IconButton(
+                            icon=ft.Icons.BADGE,
+                            icon_color=PRIMARY,
+                            tooltip="Change role",
+                            on_click=lambda _, name=account.username, role=account.role: open_set_role_dialog(
+                                name, role
+                            ),
+                        ),
+                    )
+                if account.username != admin_name:
+                    trailing_actions.append(
+                        ft.IconButton(
+                            icon=ft.Icons.DELETE_OUTLINE,
+                            icon_color="#E53935",
+                            tooltip="Delete account",
+                            on_click=lambda _, name=account.username: confirm_delete_user(
+                                name
+                            ),
+                        )
+                    )
+                if account.role == auth.ROLE_SUPER_ADMIN:
+                    leading_icon = ft.Icons.SHIELD
+                elif account.role == auth.ROLE_PICKER:
+                    leading_icon = ft.Icons.VERIFIED_USER
+                elif account.role == auth.ROLE_MONITOR_VIEWER:
+                    leading_icon = ft.Icons.VISIBILITY
+                else:
+                    leading_icon = ft.Icons.PERSON
+                account_rows.controls.append(
+                    ft.ListTile(
+                        leading=ft.Icon(leading_icon, color=PRIMARY),
+                        title=ft.Text(account.username, font_family=FONT_FAMILY),
+                        subtitle=muted(account.role_label),
+                        trailing=ft.Row(trailing_actions, tight=True),
+                    )
+                )
+
+            return ft.Container(
+                bgcolor=ft.Colors.WHITE,
+                border_radius=10,
+                padding=20,
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Users",
+                            weight=ft.FontWeight.W_600,
+                            font_family=FONT_FAMILY,
+                        ),
+                        muted(
+                            "Add Pickers, Admins, and Monitor Viewers. "
+                            "Picker users appear in the New Scan dropdown on tablets. "
+                            "Accounts sync when Firebase is set up."
+                        ),
+                        ft.ElevatedButton(
+                            "Add User / Picker",
+                            icon=ft.Icons.PERSON_ADD,
+                            bgcolor=PRIMARY,
+                            color=ft.Colors.WHITE,
+                            height=48,
+                            on_click=open_add_user_dialog,
+                        ),
+                        ft.OutlinedButton(
+                            "Sync users to Firebase now",
+                            icon=ft.Icons.CLOUD_UPLOAD,
+                            height=44,
+                            on_click=lambda _: sync_users_now(),
+                        ),
+                        muted(
+                            "If tablets do not see new users, publish the app_users "
+                            "rules in Firebase Console (see docs/FIREBASE_SETUP.md), "
+                            "then tap Sync users to Firebase now."
+                        ),
+                        ft.Container(
+                            content=account_rows,
+                            border=ft.Border.all(1, "#E0E0E0"),
+                            border_radius=8,
+                            padding=4,
+                        ),
+                    ],
+                    spacing=10,
+                    tight=True,
+                ),
+            )
 
         week_dropdown.on_change = on_week_change
         settings_week_dropdown.on_change = on_settings_week_change
@@ -654,6 +1001,7 @@ async def main(page: ft.Page):
                             tight=True,
                         ),
                     ),
+                    users_section(),
                     ft.TextButton(
                         "Back to board",
                         icon=ft.Icons.ARROW_BACK,
@@ -759,4 +1107,11 @@ async def main(page: ft.Page):
         )
         render_view()
 
-    show_login()
+    restored = auth.load_persisted_session()
+    if restored and auth.can_access_monitor(restored.role):
+        session["username"] = restored.username
+        session["role"] = restored.role
+        session["view"] = "board"
+        show_shell()
+    else:
+        show_login()

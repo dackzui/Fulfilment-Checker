@@ -455,8 +455,8 @@ def _firebase_error(resp: requests.Response, fallback: str) -> str:
         lower = message.lower()
         if "permission" in lower or resp.status_code in (401, 403):
             hint = (
-                " — open Realtime Database → Rules, paste the presence rules "
-                "from docs/FIREBASE_SETUP.md, then click Publish."
+                " — open Realtime Database -> Rules, paste the rules "
+                "from docs/FIREBASE_SETUP.md (including app_users), then click Publish."
             )
         return f"{fallback}: {message}{hint}"
     except Exception:

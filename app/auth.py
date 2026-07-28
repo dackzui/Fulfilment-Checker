@@ -245,26 +245,50 @@ def load_persisted_session() -> AdminAccount | None:
     return account
 
 
-def _publish_user_cloud(record: dict) -> None:
+def _publish_user_cloud(record: dict) -> str | None:
+    """Push one user to Firebase. Returns an error message, or None on success/skip."""
     try:
         from app import firebase_presence
 
         if not firebase_presence.is_configured():
-            return
+            return "Firebase is not set up on this device."
         firebase_presence.publish_cloud_app_user(record)
-    except Exception:
-        pass
+        return None
+    except Exception as exc:
+        return str(exc)
 
 
-def _remove_user_cloud(username: str) -> None:
+def _remove_user_cloud(username: str) -> str | None:
     try:
         from app import firebase_presence
 
         if not firebase_presence.is_configured():
-            return
+            return None
         firebase_presence.remove_cloud_app_user(username)
-    except Exception:
-        pass
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
+def push_all_users_to_cloud() -> tuple[int, str | None]:
+    """Force-publish every local account to Firebase. Returns (count, error)."""
+    try:
+        from app import firebase_presence
+
+        if not firebase_presence.is_configured():
+            return 0, "Firebase is not set up on this device."
+    except Exception as exc:
+        return 0, str(exc)
+
+    published = 0
+    last_error: str | None = None
+    for record in _load_admins():
+        err = _publish_user_cloud(record)
+        if err:
+            last_error = err
+        else:
+            published += 1
+    return published, last_error
 
 
 def sync_with_cloud(*, force: bool = False) -> bool:
@@ -554,8 +578,14 @@ def create_user(
     admins = _load_admins()
     admins.append(record)
     _save_admins(admins)
-    _publish_user_cloud(record)
-    return AdminAccount(username=name, role=new_role)
+    cloud_error = _publish_user_cloud(record)
+    account = AdminAccount(username=name, role=new_role)
+    if cloud_error:
+        # Local save succeeded; surface cloud failure to the caller.
+        raise RuntimeError(
+            f"User '{name}' was saved on this PC, but Firebase sync failed: {cloud_error}"
+        )
+    return account
 
 
 def delete_admin(actor_username: str, target_username: str) -> None:
