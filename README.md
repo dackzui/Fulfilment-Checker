@@ -6,7 +6,7 @@ Built with [Flet](https://flet.dev/) — a Flutter-based Python UI framework.
 
 ## Features
 
-- **New Scan** — capture picker/checker details, scan barcodes, verify picking
+- **New Scan** — capture picker details, scan barcodes, verify picking
 - **Hardware scanner support** — USB/handheld scanners work as keyboard input (scan into the barcode field, press Enter)
 - **Barcode Master List** — loads `BarcodeMasterList.xlsx` to resolve scanned barcodes to Item Part No.
 - **Scan verification** — green checkmarks when scanned part and qty match the uploaded picking ticket
@@ -56,6 +56,39 @@ APK output: `build\apk\`. The first build downloads Flutter/Android tooling (10�
 `build/` is git-ignored — only the APK output is regenerated; your source stays the project you edit.
 
 Configuration: `pyproject.toml` (app name, bundle id, icons, packaged files).
+
+## Top Pickers Monitor (desktop)
+
+Super Admin / Monitor Viewer board for live rankings. Dev run:
+
+```bat
+run-monitor.bat
+```
+
+### Build / install (repeatable)
+
+On this PC (x64 or ARM64):
+
+```bat
+build-monitor.bat
+```
+
+Or:
+
+```powershell
+.\scripts\build_monitor.ps1              # build + install shortcuts
+.\scripts\build_monitor.ps1 -BuildOnly   # EXE only under dist\monitor\
+.\scripts\build_monitor.ps1 -InstallOnly # reinstall last build
+```
+
+- Build output: `dist\monitor\DEKSTopPickersMonitor\`
+- Installs to: `%LOCALAPPDATA%\Programs\DEKSTopPickersMonitor\`
+- Creates Desktop + Start Menu shortcuts
+- Uninstall: run `Uninstall Monitor.bat` in the install folder
+
+First pack downloads/builds PyInstaller tooling (a few minutes). After that, re-run `build-monitor.bat` whenever you change the Monitor.
+
+Copy `data\firebase_config.json` into the install `data` folder if the monitor should use Who's online / cloud settings.
 
 ## Tablet / Browser Mode
 

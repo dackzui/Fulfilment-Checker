@@ -141,6 +141,7 @@ async def main(page: ft.Page):
     await init_app_storage(page)
     database.init_db()
     auth.ensure_admins_file()
+    auth.sync_with_cloud_background(force=True)
 
     page.title = "DEKS Top Pickers Monitor"
     page.theme_mode = ft.ThemeMode.LIGHT

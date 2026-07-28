@@ -872,3 +872,91 @@ def start_presence_scheduler(
 
 def stop_presence_scheduler() -> None:
     _scheduler_stop.set()
+
+
+# --- Shared app users (usernames / password hashes) ---
+
+
+def _app_users_url(username: str | None = None) -> str:
+    base = f"{resolve_config()['database_url']}/app_users"
+    if not username:
+        return f"{base}.json"
+    key = re.sub(r"[.#$\[\]]+", "_", (username or "").strip().lower())
+    return f"{base}/{key}.json"
+
+
+def fetch_cloud_app_users() -> list[dict[str, str]]:
+    """Return shared user records from Firebase (hashes only, never plaintext)."""
+    if not is_configured():
+        return []
+    token = _ensure_id_token()
+    resp = requests.get(
+        _app_users_url(),
+        params={"auth": token},
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not load app users"))
+    raw = resp.json() or {}
+    if not isinstance(raw, dict):
+        return []
+    users: list[dict[str, str]] = []
+    for _key, row in raw.items():
+        if not isinstance(row, dict):
+            continue
+        username = str(row.get("username") or "").strip()
+        salt = str(row.get("salt") or "").strip()
+        password_hash = str(row.get("password_hash") or "").strip()
+        if not username or not salt or not password_hash:
+            continue
+        users.append(
+            {
+                "username": username,
+                "role": str(row.get("role") or "admin").strip(),
+                "salt": salt,
+                "password_hash": password_hash,
+                "updated_at": str(row.get("updated_at") or "").strip(),
+            }
+        )
+    return users
+
+
+def publish_cloud_app_user(record: dict) -> None:
+    """Create/update one shared user account in Firebase."""
+    username = str(record.get("username") or "").strip()
+    if not username or not is_configured():
+        return
+    token = _ensure_id_token()
+    payload = {
+        "username": username,
+        "role": str(record.get("role") or "admin"),
+        "salt": str(record.get("salt") or ""),
+        "password_hash": str(record.get("password_hash") or ""),
+        "updated_at": str(record.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+        "firebase_uid": _firebase_uid(),
+    }
+    if not payload["salt"] or not payload["password_hash"]:
+        return
+    resp = requests.put(
+        _app_users_url(username),
+        params={"auth": token},
+        json=payload,
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not save app user"))
+
+
+def remove_cloud_app_user(username: str) -> None:
+    """Remove one shared user account from Firebase."""
+    cleaned = (username or "").strip()
+    if not cleaned or not is_configured():
+        return
+    token = _ensure_id_token()
+    resp = requests.delete(
+        _app_users_url(cleaned),
+        params={"auth": token},
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not remove app user"))

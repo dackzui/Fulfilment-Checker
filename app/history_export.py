@@ -111,7 +111,7 @@ def _write_session_section(pdf: FPDF, session: dict) -> None:
         0,
         6,
         _safe_text(
-            f"Picker: {session.get('picker_name', '')}    Checker: {session.get('checker_name', '')}    "
+            f"Picker: {session.get('picker_name', '')}    User: {session.get('checker_name', '')}    "
             f"Checked: {format_check_when(session)}    Boxes: {session.get('no_of_boxes') or '—'}"
         ),
         ln=True,

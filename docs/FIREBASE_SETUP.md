@@ -68,6 +68,10 @@ You can always find them later under **Project settings** (gear) → **Your apps
     "picker_names": {
       ".read": "auth != null",
       ".write": "auth != null"
+    },
+    "app_users": {
+      ".read": "auth != null",
+      ".write": "auth != null"
     }
   }
 }
@@ -80,6 +84,7 @@ Meaning:
 - a device can only update its own presence row
 - `dashboard_settings` stores the Home week-graph filter (This week / Last week) and optional prize message for the top picker. Only Super Admin should change these in the app / monitor UI.
 - `picker_names` is the shared picker list for all tablets (Manage Picker Names)
+- `app_users` stores shared app logins (usernames, roles, password hashes — never plaintext). Add/change users in Settings on any tablet; others pick them up on next sign-in.
 
 ---
 

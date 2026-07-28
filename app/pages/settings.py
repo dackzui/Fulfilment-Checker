@@ -137,9 +137,9 @@ def build(
         )
         role_field = ft.Dropdown(
             label="Role",
-            value=auth.ROLE_CHECKER,
+            value=auth.ROLE_PICKER,
             options=[
-                ft.dropdown.Option(auth.ROLE_CHECKER, "Checker"),
+                ft.dropdown.Option(auth.ROLE_PICKER, "Picker"),
                 ft.dropdown.Option(auth.ROLE_ADMIN, "Admin"),
                 ft.dropdown.Option(auth.ROLE_MONITOR_VIEWER, "Monitor Viewer"),
             ],
@@ -154,7 +154,7 @@ def build(
                 account = create_user(
                     (username_field.value or "").strip(),
                     password_field.value or "",
-                    role=role_field.value or auth.ROLE_CHECKER,
+                    role=role_field.value or auth.ROLE_PICKER,
                 )
                 page.pop_dialog()
                 show_snack(f"User added — {account.username} ({account.role_label}).")
@@ -166,10 +166,10 @@ def build(
         page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title=ft.Text("Add User / Checker"),
+                title=ft.Text("Add User / Picker"),
                 content=ft.Column(
                     [
-                        muted("Create a Checker or Admin account."),
+                        muted("Create a Picker or Admin account."),
                         username_field,
                         password_field,
                         role_field,
@@ -241,9 +241,9 @@ def build(
 
         role_field = ft.Dropdown(
             label="Role",
-            value=current_role,
+            value=current_role if current_role != "checker" else auth.ROLE_PICKER,
             options=[
-                ft.dropdown.Option(auth.ROLE_CHECKER, "Checker"),
+                ft.dropdown.Option(auth.ROLE_PICKER, "Picker"),
                 ft.dropdown.Option(auth.ROLE_ADMIN, "Admin"),
                 ft.dropdown.Option(auth.ROLE_MONITOR_VIEWER, "Monitor Viewer"),
             ],
@@ -257,7 +257,7 @@ def build(
             try:
                 account = set_user_role(
                     target_username,
-                    role_field.value or auth.ROLE_CHECKER,
+                    role_field.value or auth.ROLE_PICKER,
                 )
                 page.pop_dialog()
                 show_snack(
@@ -318,6 +318,10 @@ def build(
     account_controls: list[ft.Control] = []
     if is_super_admin:
         try:
+            auth.sync_with_cloud(force=False)
+        except Exception:
+            pass
+        try:
             admin_accounts = list_admin_users()
         except PermissionError:
             admin_accounts = []
@@ -359,7 +363,7 @@ def build(
                 )
             if account.role == auth.ROLE_SUPER_ADMIN:
                 leading_icon = ft.Icons.SHIELD
-            elif account.role == auth.ROLE_CHECKER:
+            elif account.role == auth.ROLE_PICKER:
                 leading_icon = ft.Icons.VERIFIED_USER
             elif account.role == auth.ROLE_MONITOR_VIEWER:
                 leading_icon = ft.Icons.VISIBILITY
@@ -379,7 +383,7 @@ def build(
                 ft.Row(
                     [
                         action_button(
-                            "Add User / Checker",
+                            "Add User / Picker",
                             ft.Icons.PERSON_ADD,
                             on_click=open_add_user_dialog,
                         ),
@@ -396,14 +400,16 @@ def build(
         )
     elif is_admin:
         account_controls.append(
-            muted("Only Super Admin can add Checkers and manage user accounts.")
+            muted("Only Super Admin can add Pickers and manage user accounts.")
         )
     else:
         account_controls.append(muted("Sign in as Super Admin to manage users."))
 
     accounts_section = _card(
         "Admin Accounts",
-        "Add Checkers, Admins, and Monitor Viewers; set passwords and change roles.",
+        "Users and passwords sync to all tablets when Firebase is set up. "
+        "Picker users appear in the New Scan picker dropdown. "
+        "Add Pickers, Admins, and Monitor Viewers; set passwords and change roles.",
         admin_status,
         *account_controls,
     )

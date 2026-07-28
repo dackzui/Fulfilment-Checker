@@ -43,13 +43,21 @@ class ScannerApp:
 
         database.init_db()
         auth.ensure_admins_file()
+        restored = auth.load_persisted_session()
+        if restored:
+            self.admin_username = restored.username
+            self.admin_role = restored.role
+            page._session_username = restored.username
+            page._session_role = restored.role
+        else:
+            stored_user = getattr(page, "_session_username", None)
+            stored_role = getattr(page, "_session_role", None)
+            if stored_user and not self.admin_username:
+                self.admin_username = stored_user
+                self.admin_role = stored_role
+        auth.sync_with_cloud_background(force=True)
 
         page._scanner_app = self
-        stored_user = getattr(page, "_session_username", None)
-        stored_role = getattr(page, "_session_role", None)
-        if stored_user and not self.admin_username:
-            self.admin_username = stored_user
-            self.admin_role = stored_role
 
         self.file_picker = ft.FilePicker()
         self.url_launcher = ft.UrlLauncher()
@@ -617,6 +625,7 @@ class ScannerApp:
             self.admin_role = account.role
             self.page._session_username = account.username
             self.page._session_role = account.role
+            auth.save_persisted_session(account.username, account.role)
             self._refresh_sidebar_user()
             self._publish_presence_now(online=True)
             return True
@@ -624,6 +633,12 @@ class ScannerApp:
 
     def get_logged_in(self) -> tuple[str | None, str | None]:
         if self.admin_username:
+            # Refresh role from disk in case cloud sync migrated checker → picker.
+            account = auth.get_account(self.admin_username)
+            if account and account.role != self.admin_role:
+                self.admin_role = account.role
+                self.page._session_role = account.role
+                auth.save_persisted_session(account.username, account.role)
             return self.admin_username, self.admin_role
         stored_user = getattr(self.page, "_session_username", None)
         stored_role = getattr(self.page, "_session_role", None)
@@ -632,6 +647,14 @@ class ScannerApp:
             self.admin_role = stored_role
             self._refresh_sidebar_user()
             return stored_user, stored_role
+        restored = auth.load_persisted_session()
+        if restored:
+            self.admin_username = restored.username
+            self.admin_role = restored.role
+            self.page._session_username = restored.username
+            self.page._session_role = restored.role
+            self._refresh_sidebar_user()
+            return restored.username, restored.role
         return None, None
 
     def logout_admin(self) -> None:
@@ -639,6 +662,7 @@ class ScannerApp:
         self.admin_role = None
         self.page._session_username = None
         self.page._session_role = None
+        auth.clear_persisted_session()
         self._refresh_sidebar_user()
         # Device stays open; clear logged-in user on the presence board.
         self._publish_presence_now(online=True)

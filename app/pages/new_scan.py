@@ -96,36 +96,47 @@ def build(
     ITEMS_LIST_HEIGHT = max(260, ITEMS_PANEL_HEIGHT - 72)
     ITEMS_LIST_BODY_HEIGHT = max(200, ITEMS_LIST_HEIGHT - LIST_HEADER_HEIGHT)
 
-    def format_person_name_field(field: ft.TextField):
-        if field.value:
-            field.value = capitalize_person_name(field.value)
-            page.update()
-
     picker = person_name_dropdown(
-        hint="Select or enter picker name",
-        options=database.list_picker_names(),
+        hint="Select picker",
+        options=auth.list_picker_usernames(),
     )
-    checker = text_input(hint="Enter checker name", expand=False)
 
     def refresh_picker_options(*, keep_value: bool = True, sync: bool = False):
-        from app import firebase_presence
-
         current = capitalize_person_name(picker.value or "") if keep_value else ""
+        # Always paint from local cache first; optional sync runs in the background.
+        names = list(auth.list_picker_usernames(sync=False))
         if sync:
-            try:
-                names = list(firebase_presence.sync_picker_names())
-            except Exception:
-                names = list(database.list_picker_names())
-        else:
-            names = list(database.list_picker_names())
-        if current and current not in names:
-            names.append(current)
+            def work():
+                try:
+                    auth.sync_with_cloud(force=False)
+                except Exception:
+                    pass
+
+                def apply():
+                    refresh_picker_options(keep_value=True, sync=False)
+                    apply_default_picker()
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
+
+                page.run_thread(apply)
+
+            page.run_thread(work)
+
+        matched = auth.match_picker_username(current) if current else None
+        if matched and matched not in names:
+            names.append(matched)
             names.sort(key=str.casefold)
         picker.options = [
             ft.dropdown.Option(key=name, text=name) for name in names
         ]
-        if current:
+        if matched:
+            picker.value = matched
+        elif current and current in names:
             picker.value = current
+        elif not keep_value:
+            picker.value = None
         # Only update after the dropdown is on the page (avoids Flet startup crash).
         try:
             if picker.page is not None:
@@ -134,27 +145,39 @@ def build(
             pass
 
     def remember_picker_from_field():
-        name = capitalize_person_name(picker.value or "").strip()
+        name = auth.match_picker_username(picker.value or "")
         if not name:
             return
         from app import firebase_presence
 
-        firebase_presence.remember_picker_name_synced(name)
+        picker.value = name
         firebase_presence.set_default_picker(name)
         refresh_picker_options(keep_value=True, sync=False)
 
     def on_picker_blur(_=None):
-        if picker.value:
+        matched = auth.match_picker_username(picker.value or "")
+        if matched:
+            picker.value = matched
+            remember_picker_from_field()
+        elif picker.value:
             picker.value = capitalize_person_name(picker.value)
-        remember_picker_from_field()
 
     def apply_default_picker():
         from app import firebase_presence
 
+        username, role = current_session()
+        if role == auth.ROLE_PICKER and username:
+            picker.value = capitalize_person_name(username)
+            refresh_picker_options(keep_value=True)
+            return
+
         default = firebase_presence.get_default_picker()
         if not default:
             return
-        picker.value = default
+        matched = auth.match_picker_username(default)
+        if not matched:
+            return
+        picker.value = matched
         refresh_picker_options(keep_value=True)
 
     def current_session() -> tuple[str | None, str | None]:
@@ -174,158 +197,9 @@ def build(
         username, _ = current_session()
         return bool(username)
 
-    manage_pickers_btn = ft.IconButton(
-        icon=ft.Icons.MANAGE_ACCOUNTS,
-        icon_color=PRIMARY,
-        tooltip="Manage picker names",
-        visible=False,
-        on_click=None,
-    )
-
-    def update_picker_manage_visibility():
-        _, role = current_session()
-        manage_pickers_btn.visible = auth.can_manage_picker_names(role)
-        if manage_pickers_btn.page is not None:
-            manage_pickers_btn.update()
-
-    def open_manage_pickers_dialog(_=None):
-        _, role = current_session()
-        if not auth.can_manage_picker_names(role):
-            show_snack("Checker or Admin login required to manage picker names.", error=True)
-            return
-
-        picker_rows = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO, height=280)
-
-        def render_picker_rows():
-            from app import firebase_presence
-
-            picker_rows.controls.clear()
-            try:
-                names = firebase_presence.sync_picker_names()
-            except Exception:
-                names = database.list_picker_names()
-            if not names:
-                picker_rows.controls.append(muted("No saved picker names yet."))
-                return
-            for name in names:
-                picker_rows.controls.append(
-                    ft.ListTile(
-                        title=ft.Text(name, font_family=FONT_FAMILY),
-                        trailing=ft.IconButton(
-                            icon=ft.Icons.DELETE_OUTLINE,
-                            icon_color="#E53935",
-                            tooltip="Remove picker name",
-                            on_click=lambda _, picker_name=name: confirm_delete_picker(picker_name),
-                        ),
-                    )
-                )
-
-        def confirm_delete_picker(picker_name: str):
-            def close_confirm(_=None):
-                page.pop_dialog()
-
-            def submit_delete(_=None):
-                from app import firebase_presence
-
-                try:
-                    firebase_presence.delete_picker_name_synced(picker_name)
-                    page.pop_dialog()
-                    render_picker_rows()
-                    refresh_picker_options()
-                    page.update()
-                    show_snack(f"Removed picker name — {picker_name} (all tablets).")
-                except Exception as exc:
-                    show_snack(f"Could not remove picker: {exc}", error=True)
-
-            page.show_dialog(
-                ft.AlertDialog(
-                    modal=True,
-                    title=ft.Text("Remove Picker Name"),
-                    content=ft.Text(
-                        f"Remove '{picker_name}' from the picker list on all tablets?",
-                        font_family=FONT_FAMILY,
-                    ),
-                    actions=[
-                        ft.TextButton("Cancel", on_click=close_confirm),
-                        ft.TextButton("Remove", on_click=submit_delete),
-                    ],
-                )
-            )
-
-        def close_dialog(_=None):
-            page.pop_dialog()
-
-        new_picker_field = ft.TextField(
-            label="Add picker name",
-            autofocus=True,
-            on_submit=lambda _: add_picker(),
-        )
-
-        def add_picker(_=None):
-            from app import firebase_presence
-
-            name = capitalize_person_name(new_picker_field.value or "").strip()
-            if not name:
-                show_snack("Enter a picker name.", error=True)
-                return
-            try:
-                firebase_presence.remember_picker_name_synced(name)
-                new_picker_field.value = ""
-                render_picker_rows()
-                refresh_picker_options(keep_value=True)
-                page.update()
-                if firebase_presence.is_configured():
-                    show_snack(f"Added picker — {name} (synced to all tablets)")
-                else:
-                    show_snack(
-                        f"Added picker — {name} (local only; set up Firebase to sync)"
-                    )
-            except Exception as exc:
-                show_snack(f"Could not add picker: {exc}", error=True)
-
-        render_picker_rows()
-        page.show_dialog(
-            ft.AlertDialog(
-                modal=True,
-                title=ft.Text("Manage Picker Names"),
-                content=ft.Column(
-                    [
-                        ft.Row(
-                            [
-                                ft.Container(content=new_picker_field, expand=True),
-                                ft.IconButton(
-                                    icon=ft.Icons.ADD,
-                                    icon_color=PRIMARY,
-                                    tooltip="Add picker name",
-                                    on_click=add_picker,
-                                ),
-                            ],
-                            vertical_alignment=ft.CrossAxisAlignment.END,
-                        ),
-                        muted(
-                            "Names sync to all tablets when Firebase is set up. "
-                            "Add new names or remove ones no longer needed."
-                        ),
-                        picker_rows,
-                    ],
-                    tight=True,
-                    spacing=12,
-                    width=360,
-                ),
-                actions=[ft.TextButton("Close", on_click=close_dialog)],
-            )
-        )
-
-    manage_pickers_btn.on_click = open_manage_pickers_dialog
-
-    def apply_logged_in_checker():
-        username, role = current_session()
-        if role == auth.ROLE_CHECKER and username:
-            checker.value = capitalize_person_name(username)
-
     login_dialog_open = False
 
-    def open_checker_login_dialog(*, on_success=None):
+    def open_login_dialog(*, on_success=None):
         nonlocal login_dialog_open
         if session_is_logged_in() or not login_admin or login_dialog_open:
             return
@@ -346,18 +220,18 @@ def build(
         def submit_login(_=None):
             name = (username_field.value or "").strip()
             password = password_field.value or ""
-            account = auth.authenticate(name, password)
-            if account is None:
+            if not login_admin(name, password):
                 show_snack("Invalid username or password.", error=True)
                 return
-            if login_admin(name, password):
-                close_dialog()
-                apply_logged_in_checker()
-                update_picker_manage_visibility()
-                page.update()
-                show_snack(f"Signed in — {account.username} ({account.role_label})")
-                if on_success:
-                    on_success()
+            close_dialog()
+            refresh_picker_options(keep_value=True, sync=False)
+            apply_default_picker()
+            page.update()
+            username, role = current_session()
+            role_label = auth.ROLE_LABELS.get(role or "", role or "")
+            show_snack(f"Signed in — {username} ({role_label})")
+            if on_success:
+                on_success()
 
         password_field.on_submit = submit_login
 
@@ -368,8 +242,8 @@ def build(
                 content=ft.Column(
                     [
                         ft.Text(
-                            "Sign in once to start scanning. You stay signed in until you "
-                            "close the app or log out from Home.",
+                            "Sign in to use New Scan. You stay signed in until you "
+                            "close the app or log out from Settings.",
                             size=13,
                             font_family=FONT_FAMILY,
                         ),
@@ -387,7 +261,13 @@ def build(
             )
         )
 
-    apply_logged_in_checker()
+    def resolved_checker_name() -> str:
+        """Use signed-in username when available; otherwise a stable placeholder."""
+        username, _ = current_session()
+        if username:
+            return capitalize_person_name(username)
+        return "Unknown"
+
     check_date = text_input(value=today, read_only=True, expand=False)
     check_date.width = 140
     check_time = text_input(value="", hint="On save", read_only=True, expand=False)
@@ -549,10 +429,6 @@ def build(
     wire_manual_entry_field(
         picker,
         on_blur_extra=on_picker_blur,
-    )
-    wire_manual_entry_field(
-        checker,
-        on_blur_extra=lambda _: format_person_name_field(checker),
     )
     wire_manual_entry_field(sales_order)
     wire_manual_entry_field(no_of_boxes)
@@ -1161,23 +1037,27 @@ def build(
         refresh_expected_table()
 
     def _normalize_person_names():
-        picker.value = capitalize_person_name(picker.value)
-        checker.value = capitalize_person_name(checker.value)
+        matched = auth.match_picker_username(picker.value or "")
+        if matched:
+            picker.value = matched
+        else:
+            picker.value = capitalize_person_name(picker.value)
         remember_picker_from_field()
 
     def _validate_basic_fields() -> bool:
         if not session_is_logged_in():
-            open_checker_login_dialog()
+            open_login_dialog()
             return False
         _normalize_person_names()
-        if not picker.value or not picker.value.strip():
-            show_snack("Picker Name is required.", error=True)
+        matched = auth.match_picker_username(picker.value or "")
+        if not matched:
+            show_snack(
+                "Select a Picker from the list (add Picker users in Settings).",
+                error=True,
+            )
             focus_field(picker)
             return False
-        if not checker.value or not checker.value.strip():
-            show_snack("Checker Name is required.", error=True)
-            focus_field(checker)
-            return False
+        picker.value = matched
         if not sales_order.value or not sales_order.value.strip():
             show_snack("Sales Order No. is required.", error=True)
             focus_field(sales_order)
@@ -1218,7 +1098,7 @@ def build(
         stamp_check_datetime()
         draft_session_id = database.save_session(
             picker_name=picker.value,
-            checker_name=checker.value,
+            checker_name=resolved_checker_name(),
             check_date=check_date.value or today,
             check_time=check_time.value or "",
             sales_order_no=sales_order.value,
@@ -1239,8 +1119,6 @@ def build(
         clear_ticket()
         picker.value = ""
         apply_default_picker()
-        checker.value = ""
-        apply_logged_in_checker()
         check_date.value = today
         check_time.value = ""
         sales_order.value = ""
@@ -1265,7 +1143,7 @@ def build(
         stamp_check_datetime()
         session_id = database.save_session(
             picker_name=picker.value,
-            checker_name=checker.value,
+            checker_name=resolved_checker_name(),
             check_date=check_date.value or today,
             check_time=check_time.value or "",
             sales_order_no=sales_order.value,
@@ -1327,18 +1205,15 @@ def build(
                         expand=True,
                         content=ft.Column(
                             [
-                                ft.Row(
-                                    [
-                                        ft.Text(
-                                            "Picker Name",
-                                            size=13,
-                                            weight=ft.FontWeight.W_600,
-                                            color=TEXT,
-                                            font_family=FONT_FAMILY,
-                                        ),
-                                        manage_pickers_btn,
-                                    ],
-                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                ft.Text(
+                                    "Picker Name",
+                                    size=13,
+                                    weight=ft.FontWeight.W_600,
+                                    color=TEXT,
+                                    font_family=FONT_FAMILY,
+                                ),
+                                muted(
+                                    "Same list as Picker users in Settings (synced on all tablets)."
                                 ),
                                 picker,
                             ],
@@ -1346,7 +1221,6 @@ def build(
                             tight=True,
                         ),
                     ),
-                    labeled_field("Checker Name", checker, expand=True),
                 ],
                 spacing=16,
             ),
@@ -1571,9 +1445,10 @@ def build(
             return
 
         draft_session_id = session_id
-        picker.value = capitalize_person_name(session["picker_name"])
-        refresh_picker_options(keep_value=True)
-        checker.value = capitalize_person_name(session["checker_name"])
+        refresh_picker_options(keep_value=False, sync=False)
+        matched = auth.match_picker_username(session["picker_name"])
+        picker.value = matched or capitalize_person_name(session["picker_name"])
+        refresh_picker_options(keep_value=True, sync=True)
         check_date.value = session["check_date"]
         check_time.value = session.get("check_time") or ""
         sales_order.value = session["sales_order_no"]
@@ -1614,9 +1489,8 @@ def build(
             refresh_picker_options(keep_value=True, sync=True)
             apply_default_picker()
             refresh_verification_status()
-        update_picker_manage_visibility()
         if not session_is_logged_in():
-            open_checker_login_dialog()
+            open_login_dialog()
         focus_scan_field()
 
     if scan_focus is not None:

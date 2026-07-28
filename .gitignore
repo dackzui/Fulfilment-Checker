@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 data/scanner.db
 data/admins.json
+data/session.json
 data/config.json
 data/cloud_credentials.json
 data/cloud_tokens/
@@ -18,6 +19,7 @@ data/items.json
 *.egg-info/
 dist/
 build/
+*.spec
 *.jks
 upload-keystore.jks
 agent-tools/

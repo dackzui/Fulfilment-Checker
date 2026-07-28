@@ -1347,7 +1347,7 @@ def _build_detail(
                 vertical_alignment=ft.CrossAxisAlignment.START,
             ),
             muted(
-                f"Picker: {session['picker_name']} · Checker: {session['checker_name']} · "
+                f"Picker: {session['picker_name']} · User: {session['checker_name']} · "
                 f"Checked: {format_check_when(session)} · Boxes: {session.get('no_of_boxes') or '—'}"
             ),
             muted(f"{len(grouped_items)} product(s) · {len(items)} scan(s)"),
