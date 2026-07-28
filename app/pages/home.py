@@ -251,9 +251,6 @@ def build(
             )
             return
         for row in rows:
-            status = "Online" if row.online else "Offline"
-            status_color = "#2E7D32" if row.online else "#9E9E9E"
-            device_bit = f" · {', '.join(row.devices or [])}" if row.devices else ""
             fulfilment_list.controls.append(
                 ft.Container(
                     bgcolor=ft.Colors.WHITE,
@@ -265,11 +262,11 @@ def build(
                             ft.Column(
                                 [
                                     ft.Text(
-                                        row.username,
+                                        row.picker_name,
                                         weight=ft.FontWeight.W_600,
                                         font_family=FONT_FAMILY,
                                     ),
-                                    muted(f"{status}{device_bit}"),
+                                    muted("Picker"),
                                 ],
                                 spacing=2,
                                 tight=True,
@@ -308,14 +305,6 @@ def build(
                                 tight=True,
                                 horizontal_alignment=ft.CrossAxisAlignment.END,
                             ),
-                            ft.Text(
-                                status,
-                                color=status_color,
-                                weight=ft.FontWeight.W_600,
-                                font_family=FONT_FAMILY,
-                                width=70,
-                                text_align=ft.TextAlign.RIGHT,
-                            ),
                         ],
                         spacing=8,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -332,7 +321,7 @@ def build(
         for row in rows:
             count = row.last_week if which == "last" else row.week
             if count > 0:
-                ranked.append((row.username, int(count)))
+                ranked.append((row.picker_name, int(count)))
         ranked.sort(key=lambda item: (-item[1], item[0].lower()))
         if ranked:
             top_name, top_count = ranked[0]
@@ -553,13 +542,14 @@ def build(
                 online_list,
                 ft.Divider(height=12, color=ft.Colors.TRANSPARENT),
                 ft.Text(
-                    "Fulfilments by user",
+                    "Fulfilments by picker",
                     size=15,
                     weight=ft.FontWeight.W_600,
                     font_family=FONT_FAMILY,
                 ),
                 muted(
-                    "Completed checks today / all time (summed from every reporting tablet)."
+                    "Completed checks today / all time by picker name "
+                    "(summed from every reporting tablet)."
                 ),
                 fulfilment_list,
                 ft.Divider(height=12, color=ft.Colors.TRANSPARENT),
@@ -570,7 +560,7 @@ def build(
                     font_family=FONT_FAMILY,
                 ),
                 muted(
-                    "Bar graph of completed fulfilments by checker (Mon–Sun). "
+                    "Bar graph of completed fulfilments by picker (Mon–Sun). "
                     "Only Super Admin can change the week filter."
                 ),
                 week_filter_row,

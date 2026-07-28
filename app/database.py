@@ -356,8 +356,8 @@ def session_stats() -> dict[str, int]:
     return stats
 
 
-def fulfilment_counts_by_checker(*, today_only: bool = False) -> dict[str, int]:
-    """Completed fulfilments (scan sessions) grouped by checker name.
+def fulfilment_counts_by_picker(*, today_only: bool = False) -> dict[str, int]:
+    """Completed fulfilments (scan sessions) grouped by picker name.
 
     ``today_only`` matches ``check_date`` in DD/MM/YYYY (local app date format).
     """
@@ -367,27 +367,27 @@ def fulfilment_counts_by_checker(*, today_only: bool = False) -> dict[str, int]:
         if today_only:
             rows = conn.execute(
                 """
-                SELECT checker_name, COUNT(*) AS count
+                SELECT picker_name, COUNT(*) AS count
                 FROM scan_sessions
                 WHERE COALESCE(status, 'completed') = 'completed'
                   AND check_date = ?
-                GROUP BY checker_name
+                GROUP BY picker_name
                 """,
                 (today,),
             ).fetchall()
         else:
             rows = conn.execute(
                 """
-                SELECT checker_name, COUNT(*) AS count
+                SELECT picker_name, COUNT(*) AS count
                 FROM scan_sessions
                 WHERE COALESCE(status, 'completed') = 'completed'
-                GROUP BY checker_name
+                GROUP BY picker_name
                 """
             ).fetchall()
 
     counts: dict[str, int] = {}
     for row in rows:
-        name = capitalize_person_name(str(row["checker_name"] or "")).strip()
+        name = capitalize_person_name(str(row["picker_name"] or "")).strip()
         if not name:
             name = "Unknown"
         counts[name] = counts.get(name, 0) + int(row["count"])
@@ -405,13 +405,13 @@ def week_date_bounds(which: str = "this") -> tuple[date, date]:
     return start, end
 
 
-def fulfilment_counts_by_checker_range(start: date, end: date) -> dict[str, int]:
+def fulfilment_counts_by_picker_range(start: date, end: date) -> dict[str, int]:
     """Completed fulfilments whose check_date falls in ``start``..``end`` inclusive."""
     with _connect() as conn:
         _migrate(conn)
         rows = conn.execute(
             """
-            SELECT checker_name, check_date
+            SELECT picker_name, check_date
             FROM scan_sessions
             WHERE COALESCE(status, 'completed') = 'completed'
             """
@@ -422,7 +422,7 @@ def fulfilment_counts_by_checker_range(start: date, end: date) -> dict[str, int]
         session_date = _parse_display_date(str(row["check_date"] or ""))
         if session_date is None or session_date < start or session_date > end:
             continue
-        name = capitalize_person_name(str(row["checker_name"] or "")).strip()
+        name = capitalize_person_name(str(row["picker_name"] or "")).strip()
         if not name:
             name = "Unknown"
         counts[name] = counts.get(name, 0) + 1
@@ -430,13 +430,13 @@ def fulfilment_counts_by_checker_range(start: date, end: date) -> dict[str, int]
 
 
 def local_fulfilment_snapshot() -> dict[str, Any]:
-    """Compact stats payload for Firebase presence heartbeats."""
-    today_map = fulfilment_counts_by_checker(today_only=True)
-    total_map = fulfilment_counts_by_checker(today_only=False)
+    """Compact stats payload for Firebase presence heartbeats (by picker)."""
+    today_map = fulfilment_counts_by_picker(today_only=True)
+    total_map = fulfilment_counts_by_picker(today_only=False)
     week_start, week_end = week_date_bounds("this")
     last_start, last_end = week_date_bounds("last")
-    week_map = fulfilment_counts_by_checker_range(week_start, week_end)
-    last_week_map = fulfilment_counts_by_checker_range(last_start, last_end)
+    week_map = fulfilment_counts_by_picker_range(week_start, week_end)
+    last_week_map = fulfilment_counts_by_picker_range(last_start, last_end)
     return {
         "today": today_map,
         "total": total_map,

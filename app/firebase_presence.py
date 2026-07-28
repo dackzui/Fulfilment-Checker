@@ -55,7 +55,9 @@ class PresenceEntry:
 
 @dataclass
 class UserFulfilmentRow:
-    username: str
+    """One picker's fulfilment totals (aggregated across devices)."""
+
+    picker_name: str
     today: int
     total: int
     week: int = 0
@@ -66,6 +68,11 @@ class UserFulfilmentRow:
     def __post_init__(self) -> None:
         if self.devices is None:
             self.devices = []
+
+    @property
+    def username(self) -> str:
+        """Back-compat alias used by older UI code."""
+        return self.picker_name
 
 
 def _config_path() -> Path:
@@ -438,23 +445,13 @@ def fetch_presence() -> list[PresenceEntry]:
 
 
 def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRow]:
-    """Sum completed fulfilments per checker across all reporting devices."""
+    """Sum completed fulfilments per picker across all reporting devices."""
     today: dict[str, int] = {}
     total: dict[str, int] = {}
     week: dict[str, int] = {}
     last_week: dict[str, int] = {}
-    online_users: set[str] = set()
-    devices_by_user: dict[str, list[str]] = {}
 
     for entry in entries:
-        if entry.username and entry.online:
-            key = entry.username.strip()
-            if key:
-                online_users.add(key.casefold())
-                devices_by_user.setdefault(key, [])
-                if entry.device_label not in devices_by_user[key]:
-                    devices_by_user[key].append(entry.device_label)
-
         for name, count in (entry.stats_today or {}).items():
             today[name] = today.get(name, 0) + int(count)
         for name, count in (entry.stats_total or {}).items():
@@ -464,25 +461,31 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
         for name, count in (entry.stats_last_week or {}).items():
             last_week[name] = last_week.get(name, 0) + int(count)
 
+    # Mark a picker "online" if any online tablet recently reported that picker
+    # in today's stats (they are actively being fulfilled on an open device).
+    online_pickers: set[str] = set()
+    for entry in entries:
+        if not entry.online:
+            continue
+        for name in (entry.stats_today or {}):
+            if int((entry.stats_today or {}).get(name, 0)) > 0:
+                online_pickers.add(name.casefold())
+
     names = sorted(
         set(today) | set(total) | set(week) | set(last_week),
         key=lambda n: (-today.get(n, 0), n.lower()),
     )
     rows: list[UserFulfilmentRow] = []
     for name in names:
-        matching_devices = []
-        for key, devices in devices_by_user.items():
-            if key.casefold() == name.casefold():
-                matching_devices.extend(devices)
         rows.append(
             UserFulfilmentRow(
-                username=name,
+                picker_name=name,
                 today=int(today.get(name, 0)),
                 total=int(total.get(name, 0)),
                 week=int(week.get(name, 0)),
                 last_week=int(last_week.get(name, 0)),
-                online=name.casefold() in online_users,
-                devices=matching_devices,
+                online=name.casefold() in online_pickers,
+                devices=[],
             )
         )
     return rows
@@ -562,7 +565,7 @@ def dashboard_snapshot() -> dict[str, Any]:
         )
         rows = [
             UserFulfilmentRow(
-                username=name,
+                picker_name=name,
                 today=int(today.get(name, 0)),
                 total=int(total.get(name, 0)),
                 week=int(week.get(name, 0)),
