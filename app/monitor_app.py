@@ -643,7 +643,7 @@ async def main(page: ft.Page):
                         ),
                     ),
                     ft.TextButton(
-                        "← Back to board",
+                        "Back to board",
                         icon=ft.Icons.ARROW_BACK,
                         on_click=open_board,
                     ),
