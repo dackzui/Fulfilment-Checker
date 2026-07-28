@@ -141,6 +141,7 @@ def build(
             options=[
                 ft.dropdown.Option(auth.ROLE_CHECKER, "Checker"),
                 ft.dropdown.Option(auth.ROLE_ADMIN, "Admin"),
+                ft.dropdown.Option(auth.ROLE_MONITOR_VIEWER, "Monitor Viewer"),
             ],
             width=320,
         )
@@ -244,6 +245,7 @@ def build(
             options=[
                 ft.dropdown.Option(auth.ROLE_CHECKER, "Checker"),
                 ft.dropdown.Option(auth.ROLE_ADMIN, "Admin"),
+                ft.dropdown.Option(auth.ROLE_MONITOR_VIEWER, "Monitor Viewer"),
             ],
             width=320,
         )
@@ -359,6 +361,8 @@ def build(
                 leading_icon = ft.Icons.SHIELD
             elif account.role == auth.ROLE_CHECKER:
                 leading_icon = ft.Icons.VERIFIED_USER
+            elif account.role == auth.ROLE_MONITOR_VIEWER:
+                leading_icon = ft.Icons.VISIBILITY
             else:
                 leading_icon = ft.Icons.PERSON
             account_rows.controls.append(
@@ -399,7 +403,7 @@ def build(
 
     accounts_section = _card(
         "Admin Accounts",
-        "Add Checkers and Admins, set passwords, and change roles.",
+        "Add Checkers, Admins, and Monitor Viewers; set passwords and change roles.",
         admin_status,
         *account_controls,
     )

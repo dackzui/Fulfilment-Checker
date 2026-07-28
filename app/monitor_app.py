@@ -152,7 +152,7 @@ async def main(page: ft.Page):
     page.window.min_width = 900
     page.window.min_height = 640
 
-    session = {"username": None, "view": "board"}
+    session = {"username": None, "role": None, "view": "board"}
     body = ft.Container(expand=True, padding=28)
     page.add(body)
 
@@ -170,7 +170,7 @@ async def main(page: ft.Page):
         page._monitor_token = None
 
     def build_login() -> ft.Control:
-        username_field = ft.TextField(label="Super Admin username", autofocus=True, width=360)
+        username_field = ft.TextField(label="Username", autofocus=True, width=360)
         password_field = ft.TextField(
             label="Password",
             password=True,
@@ -178,7 +178,9 @@ async def main(page: ft.Page):
             width=360,
             on_submit=lambda _: try_login(),
         )
-        status = muted("Sign in with a Super Admin account to open the live board.")
+        status = muted(
+            "Sign in as Super Admin (full access) or Monitor Viewer (view only)."
+        )
 
         def try_login(_=None):
             account = auth.authenticate(username_field.value or "", password_field.value or "")
@@ -186,11 +188,14 @@ async def main(page: ft.Page):
                 status.value = "Invalid username or password."
                 page.update()
                 return
-            if account.role != auth.ROLE_SUPER_ADMIN:
-                status.value = "Only Super Admin can use this monitor app."
+            if not auth.can_access_monitor(account.role):
+                status.value = (
+                    "Only Super Admin or Monitor Viewer can use this monitor app."
+                )
                 page.update()
                 return
             session["username"] = account.username
+            session["role"] = account.role
             session["view"] = "board"
             show_shell()
 
@@ -211,7 +216,10 @@ async def main(page: ft.Page):
                             weight=ft.FontWeight.BOLD,
                             font_family=FONT_FAMILY,
                         ),
-                        muted("Desktop Super Admin board for weekly pickup rankings."),
+                        muted(
+                            "Desktop board for weekly pickup rankings. "
+                            "Monitor Viewers can watch only; Super Admin can change settings."
+                        ),
                         username_field,
                         password_field,
                         status,
@@ -238,6 +246,8 @@ async def main(page: ft.Page):
     def show_shell():
         stop_refresh()
         admin_name = session["username"] or ""
+        admin_role = session.get("role") or ""
+        can_edit = auth.can_manage_monitor_settings(admin_role)
         content_host = ft.Container(expand=True)
 
         title = ft.Text(
@@ -258,6 +268,8 @@ async def main(page: ft.Page):
             label="Week filter",
             width=220,
             value="this",
+            visible=can_edit,
+            disabled=not can_edit,
             options=[
                 ft.DropdownOption(key="this", text="This week"),
                 ft.DropdownOption(key="last", text="Last week"),
@@ -398,8 +410,13 @@ async def main(page: ft.Page):
             render_online_pickers(list(snap.get("presence") or []))
 
             if snap.get("configured"):
+                access = (
+                    "full access"
+                    if can_edit
+                    else "view only"
+                )
                 status_label.value = (
-                    f"Signed in as {admin_name} · Firebase live · "
+                    f"Signed in as {admin_name} ({access}) · Firebase live · "
                     f"{snap.get('device_count', 0)} device(s) · "
                     f"online {snap.get('online_count', 0)}"
                 )
@@ -416,7 +433,7 @@ async def main(page: ft.Page):
                         try:
                             firebase_presence.publish_heartbeat(
                                 username=admin_name,
-                                role=auth.ROLE_SUPER_ADMIN,
+                                role=admin_role,
                                 online=True,
                             )
                         except Exception:
@@ -440,6 +457,12 @@ async def main(page: ft.Page):
             page.run_thread(work)
 
         def save_week_filter(chosen: str):
+            if not can_edit:
+                show_snack("View-only accounts cannot change settings.", error=True)
+                week_dropdown.value = filter_state["value"]
+                settings_week_dropdown.value = filter_state["value"]
+                page.update()
+                return
             chosen = "last" if chosen == "last" else "this"
 
             def work():
@@ -469,6 +492,10 @@ async def main(page: ft.Page):
             save_week_filter((e.control.value or "this").strip().lower())
 
         def save_prize(_=None):
+            if not can_edit:
+                show_snack("View-only accounts cannot change settings.", error=True)
+                return
+
             def work():
                 try:
                     firebase_presence.save_dashboard_settings(
@@ -490,6 +517,9 @@ async def main(page: ft.Page):
             page.run_thread(work)
 
         def clear_prize(_=None):
+            if not can_edit:
+                show_snack("View-only accounts cannot change settings.", error=True)
+                return
             prize_field.value = ""
             page.update()
             save_prize()
@@ -497,6 +527,7 @@ async def main(page: ft.Page):
         def logout(_=None):
             stop_refresh()
             session["username"] = None
+            session["role"] = None
             show_login()
 
         def open_board(_=None):
@@ -504,6 +535,9 @@ async def main(page: ft.Page):
             render_view()
 
         def open_settings(_=None):
+            if not can_edit:
+                show_snack("View-only accounts cannot open Settings.", error=True)
+                return
             session["view"] = "settings"
             settings_status.value = (
                 "Prize message is optional. Leave blank to hide it on the board and tablets."
@@ -643,7 +677,7 @@ async def main(page: ft.Page):
                         try:
                             firebase_presence.publish_heartbeat(
                                 username=admin_name,
-                                role=auth.ROLE_SUPER_ADMIN,
+                                role=admin_role,
                                 online=True,
                             )
                         except Exception:
@@ -673,6 +707,23 @@ async def main(page: ft.Page):
 
         page.run_thread(auto_loop)
 
+        header_actions = [
+            ft.OutlinedButton(
+                "Refresh",
+                icon=ft.Icons.REFRESH,
+                on_click=refresh_now,
+            ),
+        ]
+        if can_edit:
+            header_actions.append(
+                ft.OutlinedButton(
+                    "Settings",
+                    icon=ft.Icons.SETTINGS,
+                    on_click=open_settings,
+                )
+            )
+        header_actions.append(ft.TextButton("Sign out", on_click=logout))
+
         body.content = ft.Column(
             [
                 ft.Row(
@@ -681,22 +732,19 @@ async def main(page: ft.Page):
                         ft.Column(
                             [
                                 title,
-                                muted("Live ranking for monitoring — refreshes automatically."),
+                                muted(
+                                    "Live ranking for monitoring — refreshes automatically."
+                                    + (
+                                        ""
+                                        if can_edit
+                                        else " View-only access."
+                                    )
+                                ),
                             ],
                             spacing=4,
                             expand=True,
                         ),
-                        ft.OutlinedButton(
-                            "Refresh",
-                            icon=ft.Icons.REFRESH,
-                            on_click=refresh_now,
-                        ),
-                        ft.OutlinedButton(
-                            "Settings",
-                            icon=ft.Icons.SETTINGS,
-                            on_click=open_settings,
-                        ),
-                        ft.TextButton("Sign out", on_click=logout),
+                        *header_actions,
                     ],
                     spacing=12,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,

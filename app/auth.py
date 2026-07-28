@@ -13,10 +13,12 @@ from app.paths import get_data_dir
 ROLE_SUPER_ADMIN = "super_admin"
 ROLE_ADMIN = "admin"
 ROLE_CHECKER = "checker"
+ROLE_MONITOR_VIEWER = "monitor_viewer"
 ROLE_LABELS = {
     ROLE_SUPER_ADMIN: "Super Admin",
     ROLE_ADMIN: "Admin",
     ROLE_CHECKER: "Checker",
+    ROLE_MONITOR_VIEWER: "Monitor Viewer",
 }
 
 DEFAULT_USERNAME = "admin"
@@ -198,6 +200,15 @@ def is_checker(username: str | None) -> bool:
 
 def can_manage_picker_names(role: str | None) -> bool:
     return role in (ROLE_CHECKER, ROLE_ADMIN, ROLE_SUPER_ADMIN)
+
+
+def can_access_monitor(role: str | None) -> bool:
+    """Super Admin (full) or Monitor Viewer (read-only board)."""
+    return role in (ROLE_SUPER_ADMIN, ROLE_MONITOR_VIEWER)
+
+
+def can_manage_monitor_settings(role: str | None) -> bool:
+    return role == ROLE_SUPER_ADMIN
 
 
 def list_admin_accounts(actor_username: str) -> list[AdminAccount]:
