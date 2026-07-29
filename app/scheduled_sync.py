@@ -1,4 +1,8 @@
-"""Daily scheduled sync of today's scan sessions to cloud folder / Drive."""
+"""Daily scheduled upload of each tablet's scanner.db to Firebase (fleet sync).
+
+Schedule is controlled from Top Pickers Monitor (Super Admin). Tablets pull
+fleet_sync_settings and upload into the shared device_backups tree.
+"""
 
 from __future__ import annotations
 
@@ -8,14 +12,11 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 from app import cloud_sync
-from app import database
-from app.history_export import export_report_pdf_bytes
 
 ProgressCallback = Callable[[str], None]
 
-_CONFIG_KEY_ENABLED = "auto_sync_enabled"
-_CONFIG_KEY_TIME = "auto_sync_time"  # "HH:MM" 24-hour
 _CONFIG_KEY_LAST_DATE = "auto_sync_last_date"  # "YYYY-MM-DD"
+_CONFIG_KEY_FORCE_HANDLED = "fleet_force_handled_at"
 _DEFAULT_TIME = "17:00"
 
 _scheduler_stop = threading.Event()
@@ -31,19 +32,6 @@ def _save_config(config: dict[str, Any]) -> None:
     cloud_sync._save_app_config(config)
 
 
-def get_auto_sync_enabled() -> bool:
-    return bool(_load_config().get(_CONFIG_KEY_ENABLED))
-
-
-def get_auto_sync_time() -> str:
-    raw = str(_load_config().get(_CONFIG_KEY_TIME) or _DEFAULT_TIME).strip()
-    return normalize_time(raw) or _DEFAULT_TIME
-
-
-def get_auto_sync_last_date() -> str:
-    return str(_load_config().get(_CONFIG_KEY_LAST_DATE) or "").strip()
-
-
 def normalize_time(value: str) -> str | None:
     """Accept HH:MM or H:MM; return zero-padded HH:MM or None."""
     text = (value or "").strip()
@@ -57,15 +45,43 @@ def normalize_time(value: str) -> str | None:
     return f"{hour:02d}:{minute:02d}"
 
 
+def _fleet_settings() -> dict[str, Any]:
+    from app import firebase_presence
+
+    try:
+        return firebase_presence.get_fleet_sync_settings()
+    except Exception:
+        return {"enabled": False, "time": _DEFAULT_TIME}
+
+
+def get_auto_sync_enabled() -> bool:
+    """True when Monitor has enabled fleet daily backup."""
+    return bool(_fleet_settings().get("enabled"))
+
+
+def get_auto_sync_time() -> str:
+    raw = str(_fleet_settings().get("time") or _DEFAULT_TIME).strip()
+    return normalize_time(raw) or _DEFAULT_TIME
+
+
+def get_auto_sync_last_date() -> str:
+    return str(_load_config().get(_CONFIG_KEY_LAST_DATE) or "").strip()
+
+
 def set_auto_sync(*, enabled: bool, sync_time: str) -> str:
-    """Save schedule. Returns normalized HH:MM. Raises ValueError on bad time."""
+    """Deprecated local setter — prefer Monitor fleet_sync_settings.
+
+    Kept for compatibility; writes through to Firebase when configured.
+    """
+    from app import firebase_presence
+
     normalized = normalize_time(sync_time)
     if not normalized:
         raise ValueError("Time must be HH:MM (24-hour), e.g. 17:00")
-    config = _load_config()
-    config[_CONFIG_KEY_ENABLED] = bool(enabled)
-    config[_CONFIG_KEY_TIME] = normalized
-    _save_config(config)
+    firebase_presence.save_fleet_sync_settings(
+        enabled=bool(enabled),
+        sync_time=normalized,
+    )
     return normalized
 
 
@@ -76,44 +92,34 @@ def mark_auto_sync_ran(day: date | None = None) -> None:
 
 
 def auto_sync_status_text() -> str:
-    enabled = get_auto_sync_enabled()
-    sync_time = get_auto_sync_time()
+    from app import firebase_presence
+
+    if firebase_presence.is_configured():
+        base = firebase_presence.fleet_sync_status_text()
+    else:
+        base = "Firebase not set up — fleet backup unavailable."
     last = get_auto_sync_last_date()
-    if not enabled:
-        return f"Off — would run around {sync_time} if enabled."
     if last == date.today().isoformat():
-        return f"On — today's sync already ran (scheduled {sync_time})."
-    return f"On — next sync around {sync_time} (app must be open)."
+        return f"{base} Today's upload already completed on this tablet."
+    return base
 
 
-def resolve_auto_sync_provider() -> str | None:
-    # Prefer real cloud upload (API) when signed in — especially important on tablets.
-    if cloud_sync.is_signed_in(cloud_sync.PROVIDER_ONEDRIVE):
-        return cloud_sync.PROVIDER_ONEDRIVE
-    if cloud_sync.is_signed_in(cloud_sync.PROVIDER_GOOGLE):
-        return cloud_sync.PROVIDER_GOOGLE
-    if cloud_sync.get_sync_folder() is not None:
-        return cloud_sync.PROVIDER_FOLDER
-    return None
+def _pending_force_request() -> str | None:
+    """Return force_request_at if tablets have not handled it yet."""
+    settings = _fleet_settings()
+    force_at = str(settings.get("force_request_at") or "").strip()
+    if not force_at:
+        return None
+    handled = str(_load_config().get(_CONFIG_KEY_FORCE_HANDLED) or "").strip()
+    if force_at == handled:
+        return None
+    return force_at
 
 
-def _checker_tag(username: str | None) -> str:
-    raw = (username or "").strip() or "auto"
-    safe = re.sub(r"[^\w\-]+", "_", raw, flags=re.UNICODE)
-    return (safe.strip("_") or "auto")[:40]
-
-
-def _session_payload(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    payload: list[dict[str, Any]] = []
-    for session in sessions:
-        row = dict(session)
-        ticket = row.get("picking_ticket")
-        if ticket is not None and hasattr(ticket, "__dict__"):
-            from app.pdf_parser import ticket_to_dict
-
-            row["picking_ticket"] = ticket_to_dict(ticket)
-        payload.append(row)
-    return payload
+def mark_force_request_handled(force_at: str) -> None:
+    config = _load_config()
+    config[_CONFIG_KEY_FORCE_HANDLED] = (force_at or "").strip()
+    _save_config(config)
 
 
 def run_todays_sessions_sync(
@@ -121,93 +127,84 @@ def run_todays_sessions_sync(
     checker_username: str | None = None,
     on_progress: ProgressCallback | None = None,
     force: bool = False,
-) -> cloud_sync.SyncResult | None:
-    """Export and sync all sessions with check_date = today.
+) -> dict[str, Any] | None:
+    """Upload this tablet's backup to the shared Firebase fleet backup.
 
-    Returns SyncResult on success, None if skipped (disabled / already ran /
-    nothing to sync / no destination). Raises on hard failure.
+    Returns metadata dict on success, None if skipped (disabled / already ran).
+    Raises on hard failure.
     """
-    if not force and not get_auto_sync_enabled():
+    from app import firebase_presence
+
+    force_at = _pending_force_request() if not force else None
+    force_run = bool(force or force_at)
+
+    if not force_run and not get_auto_sync_enabled():
         if on_progress:
-            on_progress("Auto-sync is disabled.")
+            on_progress("Fleet daily backup is disabled (set in Monitor).")
         return None
 
     today = date.today()
-    if not force and get_auto_sync_last_date() == today.isoformat():
+    if not force_run and get_auto_sync_last_date() == today.isoformat():
         if on_progress:
-            on_progress("Today's scheduled sync already completed.")
+            on_progress("Today's scheduled backup already completed.")
         return None
 
-    provider = resolve_auto_sync_provider()
-    if provider is None:
+    if not firebase_presence.is_configured():
         raise RuntimeError(
-            "No sync destination. Choose a tablet/PC sync folder or sign in "
-            "to Google Drive / OneDrive in Settings → Cloud Sync."
+            "Firebase is not set up. Configure it once (Who's online), "
+            "then enable Fleet data sync in the Monitor app."
         )
-
-    today_display = today.strftime("%d/%m/%Y")
-    if on_progress:
-        on_progress(f"Looking up sessions for {today_display}…")
-
-    rows = database.search_sessions(date_from=today_display, date_to=today_display)
-    full_sessions = database.get_sessions_with_items([s["id"] for s in rows])
-    if not full_sessions:
-        if on_progress:
-            on_progress("No sessions for today — nothing to sync.")
-        mark_auto_sync_ran(today)
-        return None
-
-    checker_tag = _checker_tag(checker_username)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    filter_summary = f"Auto sync — {today_display} ({len(full_sessions)} session(s))"
-
-    if on_progress:
-        on_progress(f"Building report for {len(full_sessions)} session(s)…")
-
-    pdf_bytes = export_report_pdf_bytes(
-        full_sessions,
-        filter_summary=filter_summary,
-    )
-    files = cloud_sync.prepare_sync_files(
-        pdf_bytes=pdf_bytes,
-        pdf_name=f"picking_report_daily_{checker_tag}_{stamp}.pdf",
-        backup_mode=cloud_sync.BACKUP_FILTERED,
-        filtered_sessions=_session_payload(full_sessions),
-        filter_summary=filter_summary,
-        checker_tag=checker_tag,
-    )
-
-    root_name = None
-    if provider == cloud_sync.PROVIDER_FOLDER:
-        # Use existing folder if present; otherwise create default name.
-        root_name = cloud_sync.cloud_root_folder_name(checker_tag)
-        existing = cloud_sync.sync_root_path(
-            checker_tag, root_folder_name=root_name
-        )
-        if existing is not None and existing.exists():
-            root_name = existing.name
 
     if on_progress:
         on_progress(
-            f"Uploading to {cloud_sync.PROVIDER_LABELS.get(provider, provider)}…"
+            "Force-uploading fleet backup to Firebase…"
+            if force_run
+            else "Uploading fleet backup to Firebase…"
         )
 
-    result = cloud_sync.sync_files(
-        provider,
-        files,
-        on_progress=on_progress,
-        checker_tag=checker_tag,
-        root_folder_name=root_name,
+    settings = firebase_presence.get_fleet_sync_settings()
+    # Scheduled runs always use the tablet's local today.
+    # Force runs use the admin-selected report date range from Monitor.
+    if force_run:
+        report_from = str(settings.get("report_date_from") or "")
+        report_to = str(settings.get("report_date_to") or "")
+    else:
+        today_iso = date.today().isoformat()
+        report_from = today_iso
+        report_to = today_iso
+
+    meta = firebase_presence.publish_device_scanner_backup(
+        username=checker_username,
+        output_mode=str(settings.get("output_mode") or ""),
+        report_date_from=report_from,
+        report_date_to=report_to,
     )
-    mark_auto_sync_ran(today)
+    if not force_run:
+        mark_auto_sync_ran(today)
+    if force_at:
+        mark_force_request_handled(force_at)
+    elif force:
+        # Monitor-side force: treat current request as handled if present.
+        current_force = str(settings.get("force_request_at") or "").strip()
+        if current_force:
+            mark_force_request_handled(current_force)
     if on_progress:
-        on_progress("Daily sync complete.")
-    return result
+        label = meta.get("device_label") or meta.get("device_id") or "device"
+        name = meta.get("filename") or "backup"
+        size = int(meta.get("byte_count") or 0)
+        on_progress(
+            f"Daily backup complete — {label} / {name} ({size:,} bytes) stored in Firebase."
+        )
+    return meta
 
 
 def _should_run_now(now: datetime | None = None) -> bool:
+    if _pending_force_request():
+        return True
     now = now or datetime.now()
     if get_auto_sync_last_date() == now.date().isoformat():
+        return False
+    if not get_auto_sync_enabled():
         return False
     target = get_auto_sync_time()
     current = now.strftime("%H:%M")
@@ -240,23 +237,28 @@ def start_auto_sync_scheduler(
             return
         while not _scheduler_stop.is_set():
             try:
-                if get_auto_sync_enabled() and _should_run_now():
-                    username = None
-                    if get_checker_username:
-                        try:
-                            username = get_checker_username()
-                        except Exception:
-                            username = None
-                    notify("Starting scheduled daily sync…")
-                    try:
-                        run_todays_sessions_sync(
-                            checker_username=username,
-                            on_progress=notify,
+                if get_auto_sync_enabled() or _pending_force_request():
+                    if _should_run_now():
+                        username = None
+                        if get_checker_username:
+                            try:
+                                username = get_checker_username()
+                            except Exception:
+                                username = None
+                        notify(
+                            "Starting force fleet backup…"
+                            if _pending_force_request()
+                            else "Starting scheduled fleet backup…"
                         )
-                    except Exception as exc:
-                        notify(f"Scheduled sync failed: {exc}")
+                        try:
+                            run_todays_sessions_sync(
+                                checker_username=username,
+                                on_progress=notify,
+                            )
+                        except Exception as exc:
+                            notify(f"Scheduled backup failed: {exc}")
             except Exception as exc:
-                notify(f"Auto-sync scheduler error: {exc}")
+                notify(f"Fleet backup scheduler error: {exc}")
             if _scheduler_stop.wait(30):
                 break
 

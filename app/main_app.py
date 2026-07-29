@@ -56,6 +56,12 @@ class ScannerApp:
                 self.admin_username = stored_user
                 self.admin_role = stored_role
         auth.sync_with_cloud_background(force=True)
+        try:
+            from app import barcode_catalog
+
+            barcode_catalog.sync_from_cloud_background()
+        except Exception:
+            pass
 
         page._scanner_app = self
 
@@ -106,6 +112,7 @@ class ScannerApp:
                 "complete" in lower
                 or "failed" in lower
                 or "nothing to sync" in lower
+                or "nothing to" in lower
             ):
                 return
 

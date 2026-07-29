@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -456,7 +456,8 @@ def _firebase_error(resp: requests.Response, fallback: str) -> str:
         if "permission" in lower or resp.status_code in (401, 403):
             hint = (
                 " — open Realtime Database -> Rules, paste the rules "
-                "from docs/FIREBASE_SETUP.md (including app_users), then click Publish."
+                "from docs/FIREBASE_SETUP.md (including fleet_sync_settings "
+                "and device_backups), then click Publish."
             )
         return f"{fallback}: {message}{hint}"
     except Exception:
@@ -960,3 +961,787 @@ def remove_cloud_app_user(username: str) -> None:
     )
     if resp.status_code >= 400:
         raise RuntimeError(_firebase_error(resp, "Could not remove app user"))
+
+
+# --- Shared barcode master list ---
+
+_BARCODE_MASTER_MAX_BYTES = 2_500_000  # ~2.5 MB Excel
+
+
+def _barcode_master_meta_url() -> str:
+    return f"{resolve_config()['database_url']}/barcode_master/meta.json"
+
+
+def _barcode_master_content_url() -> str:
+    return f"{resolve_config()['database_url']}/barcode_master/content.json"
+
+
+def fetch_barcode_master_meta() -> dict[str, Any] | None:
+    """Return cloud barcode master metadata, or None if missing/not configured."""
+    if not is_configured():
+        return None
+    token = _ensure_id_token()
+    resp = requests.get(
+        _barcode_master_meta_url(),
+        params={"auth": token},
+        timeout=20,
+    )
+    if resp.status_code == 404:
+        return None
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not load barcode master metadata"))
+    raw = resp.json()
+    if not isinstance(raw, dict) or not raw:
+        return None
+    return raw
+
+
+def publish_barcode_master(
+    file_bytes: bytes,
+    *,
+    updated_by: str,
+    filename: str = "BarcodeMasterList.xlsx",
+    row_count: int = 0,
+) -> dict[str, Any]:
+    """Upload barcode master Excel to Firebase for all tablets."""
+    import base64
+    import hashlib
+
+    if not is_configured():
+        raise RuntimeError("Firebase is not set up on this device.")
+    if not file_bytes:
+        raise ValueError("Barcode master file is empty.")
+    if len(file_bytes) > _BARCODE_MASTER_MAX_BYTES:
+        raise ValueError(
+            f"Barcode master file is too large ({len(file_bytes):,} bytes). "
+            f"Keep under {_BARCODE_MASTER_MAX_BYTES:,} bytes."
+        )
+
+    token = _ensure_id_token()
+    digest = hashlib.sha256(file_bytes).hexdigest()
+    updated_at = datetime.now(timezone.utc).isoformat()
+    meta = {
+        "updated_at": updated_at,
+        "updated_by": (updated_by or "").strip() or "unknown",
+        "filename": (filename or "BarcodeMasterList.xlsx").strip(),
+        "byte_count": len(file_bytes),
+        "row_count": int(row_count or 0),
+        "sha256": digest,
+        "firebase_uid": _firebase_uid(),
+    }
+    content = {
+        "encoding": "base64",
+        "data": base64.b64encode(file_bytes).decode("ascii"),
+        "sha256": digest,
+        "updated_at": updated_at,
+    }
+
+    resp = requests.put(
+        _barcode_master_content_url(),
+        params={"auth": token},
+        json=content,
+        timeout=60,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not upload barcode master file"))
+
+    resp = requests.put(
+        _barcode_master_meta_url(),
+        params={"auth": token},
+        json=meta,
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not save barcode master metadata"))
+    return meta
+
+
+def download_barcode_master_bytes() -> tuple[bytes, dict[str, Any]]:
+    """Download the shared barcode master Excel from Firebase."""
+    import base64
+
+    if not is_configured():
+        raise RuntimeError("Firebase is not set up on this device.")
+    meta = fetch_barcode_master_meta()
+    if not meta:
+        raise FileNotFoundError("No barcode master list has been published yet.")
+
+    token = _ensure_id_token()
+    resp = requests.get(
+        _barcode_master_content_url(),
+        params={"auth": token},
+        timeout=60,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not download barcode master file"))
+    raw = resp.json() or {}
+    if not isinstance(raw, dict):
+        raise RuntimeError("Invalid barcode master payload from Firebase.")
+    data = str(raw.get("data") or "").strip()
+    if not data:
+        raise RuntimeError("Barcode master payload is empty.")
+    try:
+        file_bytes = base64.b64decode(data.encode("ascii"), validate=False)
+    except Exception as exc:
+        raise RuntimeError(f"Could not decode barcode master file: {exc}") from exc
+    if not file_bytes:
+        raise RuntimeError("Decoded barcode master file is empty.")
+    return file_bytes, meta
+
+
+# --- Fleet daily backup (Monitor-controlled) ---
+
+_FLEET_SYNC_DEFAULT_TIME = "17:00"
+_DEVICE_BACKUP_MAX_RAW_BYTES = 8_000_000  # ~8 MB uncompressed payload
+
+FLEET_OUTPUT_FULL_DB = "full_db"
+FLEET_OUTPUT_SESSIONS_JSON = "sessions_json"
+FLEET_OUTPUT_PDF = "pdf"
+FLEET_OUTPUT_DB_AND_PDF = "db_and_pdf"
+FLEET_OUTPUT_MODES = (
+    FLEET_OUTPUT_FULL_DB,
+    FLEET_OUTPUT_SESSIONS_JSON,
+    FLEET_OUTPUT_PDF,
+    FLEET_OUTPUT_DB_AND_PDF,
+)
+FLEET_OUTPUT_LABELS = {
+    FLEET_OUTPUT_FULL_DB: "scanner.db",
+    FLEET_OUTPUT_SESSIONS_JSON: "Sessions (JSON)",
+    FLEET_OUTPUT_PDF: "Report (PDF)",
+    FLEET_OUTPUT_DB_AND_PDF: "scanner.db + PDF (ZIP)",
+}
+
+
+def _fleet_sync_settings_url() -> str:
+    return f"{resolve_config()['database_url']}/fleet_sync_settings.json"
+
+
+def _device_backup_meta_url(device_id: str) -> str:
+    return f"{resolve_config()['database_url']}/device_backups/{device_id}/meta.json"
+
+
+def _device_backup_content_url(device_id: str) -> str:
+    return f"{resolve_config()['database_url']}/device_backups/{device_id}/content.json"
+
+
+def _device_backups_root_url() -> str:
+    return f"{resolve_config()['database_url']}/device_backups.json"
+
+
+def _normalize_fleet_time(value: str) -> str:
+    import re
+
+    text = (value or "").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        return _FLEET_SYNC_DEFAULT_TIME
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        return _FLEET_SYNC_DEFAULT_TIME
+    return f"{hour:02d}:{minute:02d}"
+
+
+def normalize_fleet_output(value: str | None) -> str:
+    cleaned = str(value or "").strip().lower()
+    if cleaned in FLEET_OUTPUT_MODES:
+        return cleaned
+    return FLEET_OUTPUT_FULL_DB
+
+
+def fleet_output_label(value: str | None) -> str:
+    mode = normalize_fleet_output(value)
+    return FLEET_OUTPUT_LABELS.get(mode, FLEET_OUTPUT_LABELS[FLEET_OUTPUT_FULL_DB])
+
+
+def normalize_fleet_report_date(value: str | None) -> str:
+    """Return YYYY-MM-DD. Accepts ISO or dd/mm/yyyy. Defaults to today."""
+    text = str(value or "").strip()
+    if text:
+        try:
+            return date.fromisoformat(text).isoformat()
+        except ValueError:
+            pass
+        match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
+        if match:
+            day, month, year = map(int, match.groups())
+            try:
+                return date(year, month, day).isoformat()
+            except ValueError:
+                pass
+    return date.today().isoformat()
+
+
+def normalize_fleet_report_range(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> tuple[str, str]:
+    """Return (from, to) as YYYY-MM-DD with from <= to. Defaults both to today."""
+    start = date.fromisoformat(normalize_fleet_report_date(date_from))
+    end = date.fromisoformat(normalize_fleet_report_date(date_to))
+    if end < start:
+        start, end = end, start
+    return start.isoformat(), end.isoformat()
+
+
+def format_fleet_report_date(value: str | None) -> str:
+    """Display date as dd/mm/yyyy."""
+    iso = normalize_fleet_report_date(value)
+    try:
+        return date.fromisoformat(iso).strftime("%d/%m/%Y")
+    except ValueError:
+        return iso
+
+
+def format_fleet_report_range(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> str:
+    start, end = normalize_fleet_report_range(date_from, date_to)
+    a = format_fleet_report_date(start)
+    b = format_fleet_report_date(end)
+    if a == b:
+        return a
+    return f"{a} – {b}"
+
+
+def get_fleet_download_folder() -> Path:
+    """Local Monitor folder used by Download all (defaults to data/fleet_backups)."""
+    local = _load_json(_app_config_path())
+    raw = str(local.get("fleet_download_folder") or "").strip()
+    if raw:
+        return Path(raw)
+    return get_data_dir() / "fleet_backups"
+
+
+def set_fleet_download_folder(path: str | Path | None) -> Path:
+    """Persist Monitor download folder. Pass None/empty to reset to default."""
+    local = _load_json(_app_config_path())
+    text = str(path or "").strip()
+    if not text:
+        local.pop("fleet_download_folder", None)
+        _save_json(_app_config_path(), local)
+        return get_fleet_download_folder()
+    folder = Path(text).expanduser()
+    folder.mkdir(parents=True, exist_ok=True)
+    local["fleet_download_folder"] = str(folder)
+    _save_json(_app_config_path(), local)
+    return folder
+
+
+def get_fleet_sync_settings() -> dict[str, Any]:
+    """Load Monitor-controlled daily backup schedule (local cache + Firebase)."""
+    local = _load_json(_app_config_path())
+    # Back-compat: single report_date becomes both from and to.
+    legacy = str(local.get("fleet_sync_report_date") or "").strip()
+    from_raw = str(local.get("fleet_sync_report_date_from") or legacy or "")
+    to_raw = str(local.get("fleet_sync_report_date_to") or legacy or "")
+    date_from, date_to = normalize_fleet_report_range(from_raw, to_raw)
+    settings = {
+        "enabled": bool(local.get("fleet_sync_enabled")),
+        "time": _normalize_fleet_time(str(local.get("fleet_sync_time") or _FLEET_SYNC_DEFAULT_TIME)),
+        "output_mode": normalize_fleet_output(str(local.get("fleet_sync_output_mode") or "")),
+        "report_date_from": date_from,
+        "report_date_to": date_to,
+        "force_request_at": str(local.get("fleet_sync_force_request_at") or "").strip() or None,
+        "updated_by": str(local.get("fleet_sync_updated_by") or "").strip() or None,
+        "updated_at": str(local.get("fleet_sync_updated_at") or "").strip() or None,
+        "download_folder": str(get_fleet_download_folder()),
+    }
+    if not is_configured():
+        return settings
+    try:
+        token = _ensure_id_token()
+        resp = requests.get(
+            _fleet_sync_settings_url(),
+            params={"auth": token},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return settings
+        raw = resp.json() or {}
+        if not isinstance(raw, dict) or not raw:
+            return settings
+        settings["enabled"] = bool(raw.get("enabled"))
+        settings["time"] = _normalize_fleet_time(str(raw.get("time") or settings["time"]))
+        settings["output_mode"] = normalize_fleet_output(
+            str(raw.get("output_mode") or settings["output_mode"])
+        )
+        legacy_remote = str(raw.get("report_date") or "").strip()
+        settings["report_date_from"], settings["report_date_to"] = normalize_fleet_report_range(
+            str(raw.get("report_date_from") or legacy_remote or settings["report_date_from"]),
+            str(raw.get("report_date_to") or legacy_remote or settings["report_date_to"]),
+        )
+        settings["force_request_at"] = (
+            str(raw.get("force_request_at") or "").strip() or settings["force_request_at"]
+        )
+        settings["updated_by"] = str(raw.get("updated_by") or "").strip() or settings["updated_by"]
+        settings["updated_at"] = str(raw.get("updated_at") or "").strip() or settings["updated_at"]
+        local["fleet_sync_enabled"] = settings["enabled"]
+        local["fleet_sync_time"] = settings["time"]
+        local["fleet_sync_output_mode"] = settings["output_mode"]
+        local["fleet_sync_report_date_from"] = settings["report_date_from"]
+        local["fleet_sync_report_date_to"] = settings["report_date_to"]
+        local.pop("fleet_sync_report_date", None)
+        local["fleet_sync_force_request_at"] = settings.get("force_request_at") or ""
+        local["fleet_sync_updated_by"] = settings.get("updated_by") or ""
+        local["fleet_sync_updated_at"] = settings.get("updated_at") or ""
+        _save_json(_app_config_path(), local)
+        settings["download_folder"] = str(get_fleet_download_folder())
+        return settings
+    except Exception:
+        return settings
+
+
+def save_fleet_sync_settings(
+    *,
+    enabled: bool,
+    sync_time: str,
+    output_mode: str | None = None,
+    report_date_from: str | None = None,
+    report_date_to: str | None = None,
+    force_request_at: str | None = None,
+    updated_by: str | None = None,
+    preserve_force_request: bool = True,
+) -> dict[str, Any]:
+    """Persist fleet schedule locally and to Firebase (Monitor Super Admin)."""
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", (sync_time or "").strip())
+    if not match:
+        raise ValueError("Time must be HH:MM (24-hour), e.g. 17:00")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise ValueError("Time must be HH:MM (24-hour), e.g. 17:00")
+    normalized = f"{hour:02d}:{minute:02d}"
+    mode = normalize_fleet_output(output_mode)
+
+    existing = get_fleet_sync_settings()
+    if force_request_at is not None:
+        force_value = (force_request_at or "").strip() or None
+    elif preserve_force_request:
+        force_value = existing.get("force_request_at")
+    else:
+        force_value = None
+
+    from_iso, to_iso = normalize_fleet_report_range(
+        report_date_from
+        if report_date_from is not None
+        else str(existing.get("report_date_from") or ""),
+        report_date_to
+        if report_date_to is not None
+        else str(existing.get("report_date_to") or ""),
+    )
+
+    updated_at = datetime.now(timezone.utc).isoformat()
+    current = {
+        "enabled": bool(enabled),
+        "time": normalized,
+        "output_mode": mode,
+        "report_date_from": from_iso,
+        "report_date_to": to_iso,
+        "force_request_at": force_value,
+        "updated_by": (updated_by or "").strip() or None,
+        "updated_at": updated_at,
+        "download_folder": str(get_fleet_download_folder()),
+    }
+
+    local = _load_json(_app_config_path())
+    local["fleet_sync_enabled"] = current["enabled"]
+    local["fleet_sync_time"] = current["time"]
+    local["fleet_sync_output_mode"] = current["output_mode"]
+    local["fleet_sync_report_date_from"] = current["report_date_from"]
+    local["fleet_sync_report_date_to"] = current["report_date_to"]
+    local.pop("fleet_sync_report_date", None)
+    local["fleet_sync_force_request_at"] = current.get("force_request_at") or ""
+    local["fleet_sync_updated_by"] = current.get("updated_by") or ""
+    local["fleet_sync_updated_at"] = updated_at
+    _save_json(_app_config_path(), local)
+
+    if not is_configured():
+        raise RuntimeError("Firebase is not set up. Configure it first (Who's online).")
+
+    token = _ensure_id_token()
+    payload = {
+        "enabled": current["enabled"],
+        "time": current["time"],
+        "output_mode": current["output_mode"],
+        "report_date_from": current["report_date_from"],
+        "report_date_to": current["report_date_to"],
+        "force_request_at": current.get("force_request_at"),
+        "updated_by": current.get("updated_by"),
+        "updated_at": updated_at,
+        "firebase_uid": _firebase_uid(),
+    }
+    resp = requests.put(
+        _fleet_sync_settings_url(),
+        params={"auth": token},
+        json=payload,
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not save fleet sync settings"))
+    return current
+
+
+def request_fleet_force_sync(
+    *,
+    updated_by: str | None = None,
+    report_date_from: str | None = None,
+    report_date_to: str | None = None,
+) -> dict[str, Any]:
+    """Ask open tablets to upload immediately (next scheduler check), bypassing schedule time."""
+    settings = get_fleet_sync_settings()
+    stamp = datetime.now(timezone.utc).isoformat()
+    return save_fleet_sync_settings(
+        enabled=bool(settings.get("enabled")),
+        sync_time=str(settings.get("time") or _FLEET_SYNC_DEFAULT_TIME),
+        output_mode=str(settings.get("output_mode") or FLEET_OUTPUT_FULL_DB),
+        report_date_from=report_date_from
+        if report_date_from is not None
+        else str(settings.get("report_date_from") or ""),
+        report_date_to=report_date_to
+        if report_date_to is not None
+        else str(settings.get("report_date_to") or ""),
+        force_request_at=stamp,
+        updated_by=updated_by,
+        preserve_force_request=False,
+    )
+
+
+def fleet_sync_status_text() -> str:
+    settings = get_fleet_sync_settings()
+    enabled = bool(settings.get("enabled"))
+    sync_time = str(settings.get("time") or _FLEET_SYNC_DEFAULT_TIME)
+    output = fleet_output_label(str(settings.get("output_mode") or ""))
+    report_disp = format_fleet_report_range(
+        str(settings.get("report_date_from") or ""),
+        str(settings.get("report_date_to") or ""),
+    )
+    by = settings.get("updated_by")
+    by_bit = f" (set by {by})" if by else ""
+    if not is_configured():
+        return "Firebase not set up — fleet backup unavailable."
+    if not enabled:
+        return (
+            f"Off — would run around {sync_time} ({output}) if enabled{by_bit}. "
+            f"Force date filter: {report_disp}."
+        )
+    return (
+        f"On — tablets upload {output} around {sync_time}{by_bit}. "
+        f"Force date filter: {report_disp}."
+    )
+
+
+def _session_payload_for_fleet(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for session in sessions:
+        row = dict(session)
+        ticket = row.get("picking_ticket")
+        if ticket is not None and hasattr(ticket, "__dict__"):
+            from app.pdf_parser import ticket_to_dict
+
+            row["picking_ticket"] = ticket_to_dict(ticket)
+        payload.append(row)
+    return payload
+
+
+def _prepare_fleet_backup_bytes(
+    output_mode: str,
+    *,
+    username: str | None = None,
+    report_date_from: str | date | None = None,
+    report_date_to: str | date | None = None,
+) -> tuple[bytes, str, str]:
+    """Build backup bytes for the selected output mode.
+
+    Returns (raw_bytes, filename, content_kind).
+    ``report_date_from`` / ``report_date_to`` filter sessions for PDF/JSON.
+    """
+    import io
+    import json
+    import zipfile
+
+    from app import database
+    from app.history_export import export_report_pdf_bytes
+
+    mode = normalize_fleet_output(output_mode)
+    from_raw = (
+        report_date_from.isoformat()
+        if isinstance(report_date_from, date)
+        else str(report_date_from or "")
+    )
+    to_raw = (
+        report_date_to.isoformat()
+        if isinstance(report_date_to, date)
+        else str(report_date_to or "")
+    )
+    from_iso, to_iso = normalize_fleet_report_range(from_raw, to_raw)
+    start = date.fromisoformat(from_iso)
+    end = date.fromisoformat(to_iso)
+    from_display = start.strftime("%d/%m/%Y")
+    to_display = end.strftime("%d/%m/%Y")
+    range_label = from_display if from_iso == to_iso else f"{from_display} – {to_display}"
+    range_stamp = (
+        start.strftime("%Y%m%d")
+        if from_iso == to_iso
+        else f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
+    )
+    tag = re.sub(r"[^\w\-]+", "_", (username or "auto").strip() or "auto")[:40] or "auto"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+
+    if mode == FLEET_OUTPUT_FULL_DB:
+        db_path = get_data_dir() / "scanner.db"
+        if not db_path.is_file():
+            raise FileNotFoundError("scanner.db not found — nothing to back up.")
+        raw = db_path.read_bytes()
+        if not raw:
+            raise ValueError("scanner.db is empty.")
+        return raw, "scanner.db", mode
+
+    rows = database.search_sessions(date_from=from_display, date_to=to_display)
+    full_sessions = database.get_sessions_with_items([s["id"] for s in rows])
+
+    if mode == FLEET_OUTPUT_SESSIONS_JSON:
+        payload = {
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "report_date_from": from_iso,
+            "report_date_to": to_iso,
+            "filter_summary": f"Fleet backup — {range_label}",
+            "session_count": len(full_sessions),
+            "username": (username or "").strip() or None,
+            "device_label": get_device_label(),
+            "sessions": _session_payload_for_fleet(full_sessions),
+        }
+        raw = json.dumps(payload, indent=2, default=str).encode("utf-8")
+        return raw, f"sessions_{range_stamp}_{tag}_{stamp}.json", mode
+
+    if mode == FLEET_OUTPUT_PDF:
+        if not full_sessions:
+            raise FileNotFoundError(
+                f"No sessions for {range_label} — nothing to export as PDF."
+            )
+        pdf_bytes = export_report_pdf_bytes(
+            full_sessions,
+            filter_summary=f"Fleet backup — {range_label} ({len(full_sessions)} session(s))",
+        )
+        return pdf_bytes, f"picking_report_{range_stamp}_{tag}_{stamp}.pdf", mode
+
+    # db_and_pdf → ZIP
+    db_path = get_data_dir() / "scanner.db"
+    if not db_path.is_file():
+        raise FileNotFoundError("scanner.db not found — nothing to back up.")
+    db_bytes = db_path.read_bytes()
+    if not db_bytes:
+        raise ValueError("scanner.db is empty.")
+    if full_sessions:
+        pdf_bytes = export_report_pdf_bytes(
+            full_sessions,
+            filter_summary=f"Fleet backup — {range_label} ({len(full_sessions)} session(s))",
+        )
+    else:
+        pdf_bytes = b""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("scanner.db", db_bytes)
+        if pdf_bytes:
+            zf.writestr(f"picking_report_{range_stamp}_{tag}_{stamp}.pdf", pdf_bytes)
+        else:
+            zf.writestr(
+                "README.txt",
+                f"No sessions for {range_label}; ZIP contains scanner.db only.\n",
+            )
+    return buf.getvalue(), f"fleet_backup_{range_stamp}_{tag}_{stamp}.zip", mode
+
+
+def publish_device_scanner_backup(
+    *,
+    username: str | None = None,
+    output_mode: str | None = None,
+    report_date_from: str | date | None = None,
+    report_date_to: str | date | None = None,
+) -> dict[str, Any]:
+    """Gzip + upload this device's backup payload to Firebase."""
+    import base64
+    import gzip
+    import hashlib
+
+    if not is_configured():
+        raise RuntimeError("Firebase is not set up on this device.")
+
+    settings = get_fleet_sync_settings()
+    mode = normalize_fleet_output(
+        output_mode or settings.get("output_mode")
+    )
+    from_raw = (
+        report_date_from.isoformat()
+        if isinstance(report_date_from, date)
+        else (
+            str(report_date_from)
+            if report_date_from is not None
+            else str(settings.get("report_date_from") or "")
+        )
+    )
+    to_raw = (
+        report_date_to.isoformat()
+        if isinstance(report_date_to, date)
+        else (
+            str(report_date_to)
+            if report_date_to is not None
+            else str(settings.get("report_date_to") or "")
+        )
+    )
+    from_iso, to_iso = normalize_fleet_report_range(from_raw, to_raw)
+    raw, filename, kind = _prepare_fleet_backup_bytes(
+        mode,
+        username=username,
+        report_date_from=from_iso,
+        report_date_to=to_iso,
+    )
+    if len(raw) > _DEVICE_BACKUP_MAX_RAW_BYTES:
+        raise ValueError(
+            f"Backup is too large ({len(raw):,} bytes). "
+            f"Keep under {_DEVICE_BACKUP_MAX_RAW_BYTES:,} bytes."
+        )
+
+    compressed = gzip.compress(raw, compresslevel=6)
+    digest = hashlib.sha256(raw).hexdigest()
+    device_id = get_device_id()
+    updated_at = datetime.now(timezone.utc).isoformat()
+    sync_date = to_iso
+    meta = {
+        "device_id": device_id,
+        "device_label": get_device_label(),
+        "username": (username or "").strip() or None,
+        "filename": filename,
+        "output_mode": kind,
+        "byte_count": len(raw),
+        "compressed_bytes": len(compressed),
+        "sha256": digest,
+        "sync_date": sync_date,
+        "report_date": sync_date,
+        "report_date_from": from_iso,
+        "report_date_to": to_iso,
+        "updated_at": updated_at,
+        "encoding": "gzip+base64",
+        "firebase_uid": _firebase_uid(),
+    }
+    content = {
+        "encoding": "gzip+base64",
+        "data": base64.b64encode(compressed).decode("ascii"),
+        "sha256": digest,
+        "byte_count": len(raw),
+        "filename": filename,
+        "output_mode": kind,
+        "updated_at": updated_at,
+        "sync_date": sync_date,
+        "report_date": sync_date,
+        "report_date_from": from_iso,
+        "report_date_to": to_iso,
+    }
+
+    token = _ensure_id_token()
+    resp = requests.put(
+        _device_backup_content_url(device_id),
+        params={"auth": token},
+        json=content,
+        timeout=90,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not upload device backup"))
+
+    resp = requests.put(
+        _device_backup_meta_url(device_id),
+        params={"auth": token},
+        json=meta,
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not save device backup metadata"))
+    return meta
+
+
+def list_device_backup_metas() -> list[dict[str, Any]]:
+    """Return metadata for every device backup currently in Firebase."""
+    if not is_configured():
+        return []
+    token = _ensure_id_token()
+    resp = requests.get(
+        _device_backups_root_url(),
+        params={"auth": token, "shallow": "true"},
+        timeout=20,
+    )
+    if resp.status_code == 404:
+        return []
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not list device backups"))
+    raw = resp.json() or {}
+    if not isinstance(raw, dict) or not raw:
+        return []
+
+    metas: list[dict[str, Any]] = []
+    for device_id in raw.keys():
+        cleaned = str(device_id or "").strip()
+        if not cleaned:
+            continue
+        try:
+            meta_resp = requests.get(
+                _device_backup_meta_url(cleaned),
+                params={"auth": token},
+                timeout=15,
+            )
+            if meta_resp.status_code >= 400:
+                continue
+            meta = meta_resp.json() or {}
+            if isinstance(meta, dict) and meta:
+                meta.setdefault("device_id", cleaned)
+                metas.append(meta)
+        except Exception:
+            continue
+
+    metas.sort(key=lambda m: str(m.get("updated_at") or ""), reverse=True)
+    return metas
+
+
+def download_device_scanner_backup(device_id: str) -> tuple[bytes, dict[str, Any]]:
+    """Download one device's scanner.db bytes from Firebase."""
+    import base64
+    import gzip
+
+    cleaned = (device_id or "").strip()
+    if not cleaned:
+        raise ValueError("device_id is required.")
+    if not is_configured():
+        raise RuntimeError("Firebase is not set up on this device.")
+
+    token = _ensure_id_token()
+    meta_resp = requests.get(
+        _device_backup_meta_url(cleaned),
+        params={"auth": token},
+        timeout=15,
+    )
+    if meta_resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(meta_resp, "Could not load backup metadata"))
+    meta = meta_resp.json() or {}
+    if not isinstance(meta, dict) or not meta:
+        raise FileNotFoundError(f"No backup found for device {cleaned}.")
+
+    resp = requests.get(
+        _device_backup_content_url(cleaned),
+        params={"auth": token},
+        timeout=90,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(_firebase_error(resp, "Could not download scanner.db backup"))
+    raw = resp.json() or {}
+    if not isinstance(raw, dict):
+        raise RuntimeError("Invalid backup payload from Firebase.")
+    data = str(raw.get("data") or "").strip()
+    if not data:
+        raise RuntimeError("Backup payload is empty.")
+    try:
+        compressed = base64.b64decode(data.encode("ascii"), validate=False)
+        file_bytes = gzip.decompress(compressed)
+    except Exception as exc:
+        raise RuntimeError(f"Could not decode scanner.db backup: {exc}") from exc
+    if not file_bytes:
+        raise RuntimeError("Decoded scanner.db backup is empty.")
+    return file_bytes, meta

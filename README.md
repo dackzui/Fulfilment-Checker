@@ -59,11 +59,13 @@ Configuration: `pyproject.toml` (app name, bundle id, icons, packaged files).
 
 ## Top Pickers Monitor (desktop)
 
-Super Admin / Monitor Viewer board for live rankings. Dev run:
+Super Admin / Monitor Viewer board for live rankings. Launch:
 
 ```bat
-run-monitor.bat
+Run-Monitor.bat
 ```
+
+Uses the packaged EXE under `dist\monitor\` when you have built it (`build-monitor.bat`); otherwise starts from the Python virtualenv. Both modes use this project's `data\` folder (Firebase, users, barcode list).
 
 ### Build / install (repeatable)
 
@@ -102,13 +104,13 @@ Open `http://<your-pc-ip>:8550` in the tablet browser. Barcode scanners that act
 
 ## Barcode Master List
 
-The barcode list is stored inside the app at:
+The barcode list is stored on each device as:
 
 `data/BarcodeMasterList.xlsx`
 
-On startup, the app loads this file into the local database.
+**Super Admin** uploads and publishes the list from **Top Pickers Monitor → Settings → Barcode Master List**. Tablets download the shared file from Firebase automatically when the app opens.
 
-**Only admins** can upload a new barcode list from the app. On **Home**, click **Update Barcode List** and sign in when prompted.
+When a barcode is scanned, the app looks up **Item Part No.** and **Description** from this file, then compares against the uploaded picking ticket **Qty Ordered**. If the barcode has a **Box Qty** value, that quantity is applied automatically (× the Qty field). Otherwise each scan counts as **1 item**. All scans for the same **Item Part No.** are summed together against the picking ticket. **PalletQty** is kept in the master list for reference only — pallets are not scanned via barcode yet.
 
 ### Admin login
 
@@ -118,32 +120,28 @@ On first run, the app creates `data/admins.json` with default credentials:
 - **Password:** `admin`
 - **Role:** Super Admin
 
-Sign in from **Home → Admin Accounts**. After login:
+Sign in from **Settings**. After login:
 
-- **Super Admin** — add users, set any user's password, upload barcode list, delete history.
-- **Admin** — upload barcode list and delete history only.
+- **Super Admin** — add users, set passwords, manage Monitor settings / barcode publish, delete history.
+- **Admin** — delete history and cloud sync actions as allowed.
+- **Picker** — appears in the New Scan picker dropdown.
 
-Use **Add User** and the key icon (**Set Password**) on the user list. New users are created as Admin.
+Use **Add User / Picker** and the key icon (**Set Password**) on the user list.
 
-## Cloud Sync (History)
+## Fleet data sync (daily scanner.db)
 
-On **History**, click **Sync** to upload the filtered report PDF plus a full DB or filtered sessions backup.
+Controlled from **Top Pickers Monitor → Settings → Fleet data sync** (Super Admin):
 
-### Simple setup (recommended — no API keys)
+1. Enable daily backup and set the time (e.g. 17:00)
+2. Leave each tablet app open near that time
+3. Tablets upload their `scanner.db` into Firebase (`device_backups`)
+4. On the Monitor PC, use **Refresh list** / **Download all to this PC**
 
-1. Open **Settings → Cloud Sync**
-2. Click **Choose cloud folder**
-3. Select your local **Google Drive** or **OneDrive** folder on this PC
-4. Use **History → Sync** and choose **Cloud folder on this PC**
+Publish the updated Firebase rules in `docs/FIREBASE_SETUP.md` (includes `fleet_sync_settings` and `device_backups`).
 
-Files are copied to:
-`YourFolder / Picking Barcode Scanner / History / YYYY-MM-DD_HHMM /`
+## History export
 
-### Optional browser sign-in
-
-If IT enables Google / Microsoft app login in `app/cloud_oauth_defaults.py`, Settings also shows **Sign in with Google** / **Sign in with OneDrive** (browser login, like ShareFile — users never enter API keys).
-
-When a barcode is scanned, the app looks up **Item Part No.** and **Description** from this file, then compares against the uploaded picking ticket **Qty Ordered**. If the barcode has a **Box Qty** value, that quantity is applied automatically (× the Qty field). Otherwise each scan counts as **1 item**. All scans for the same **Item Part No.** are summed together against the picking ticket. **PalletQty** is kept in the master list for reference only — pallets are not scanned via barcode yet.
+On **History**, use **Export Report PDF** for a filtered PDF. Daily tablet backups are controlled from **Top Pickers Monitor → Fleet data sync**.
 
 ## Sample barcodes (from picking ticket SO5570391)
 

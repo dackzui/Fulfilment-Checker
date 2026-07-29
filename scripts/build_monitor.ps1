@@ -132,6 +132,8 @@ function Build-Monitor {
         "--hidden-import", "app.auth",
         "--hidden-import", "app.database",
         "--hidden-import", "app.firebase_presence",
+        "--hidden-import", "app.scheduled_sync",
+        "--hidden-import", "app.barcode_catalog",
         "--hidden-import", "app.paths",
         "--hidden-import", "app.theme",
         "--hidden-import", "app.components"
@@ -187,18 +189,12 @@ function Build-Monitor {
         Copy-Item $fbSrc (Join-Path $dataBeside "firebase_config.json") -Force
     }
 
-    # Convenience launcher next to the build folder.
+    # Convenience launcher — prefer root Run-Monitor.bat for day-to-day use.
     $launcher = Join-Path $distRoot "Run Monitor.bat"
     @"
 @echo off
-cd /d "%~dp0$appName"
-REM Prefer the project data folder when this build still lives under the repo.
-set "REPO_DATA=%~dp0..\..\data"
-if exist "%REPO_DATA%\firebase_config.json" (
-  set "PICKER_CHECK_DATA=%REPO_DATA%"
-  set "PICKER_CHECK_SOURCE_DATA=%REPO_DATA%"
-)
-start "" "%~dp0$appName\$exeName"
+cd /d "%~dp0..\.."
+call "Run-Monitor.bat"
 "@ | Set-Content -Path $launcher -Encoding ASCII
 
     # PyInstaller also leaves an incomplete EXE under build\ — that path has no
@@ -212,10 +208,10 @@ start "" "%~dp0$appName\$exeName"
 This folder is PyInstaller work files only.
 
 Run the Monitor from:
-  dist\monitor\DEKSTopPickersMonitor\DEKSTopPickersMonitor.exe
-or double-click:
-  dist\monitor\Run Monitor.bat
-or use the Desktop shortcut after: build-monitor.bat
+  Run-Monitor.bat
+(at the project root)
+
+Do not open EXEs inside build\ — that folder is incomplete.
 "@ | Set-Content -Path $workNote -Encoding ASCII
 
     Write-Host ""
@@ -224,7 +220,7 @@ or use the Desktop shortcut after: build-monitor.bat
     Write-Host "  $launcher"
     Write-Host ""
     Write-Host "Do NOT open build\$appName\$exeName (incomplete)." -ForegroundColor Yellow
-    Write-Host "Use dist\monitor\Run Monitor.bat instead." -ForegroundColor Yellow
+    Write-Host "Day to day, use:  Run-Monitor.bat" -ForegroundColor Yellow
 }
 
 function New-Shortcut {

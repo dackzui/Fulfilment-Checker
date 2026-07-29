@@ -343,7 +343,7 @@ def ensure_loaded() -> int:
     if not path.exists():
         raise FileNotFoundError(
             f"Barcode master list not found at {path}. "
-            "Use 'Update Barcode List' to import BarcodeMasterList.xlsx."
+            "Super Admin publishes BarcodeMasterList.xlsx from Top Pickers Monitor."
         )
 
     file_mtime = str(path.stat().st_mtime)
@@ -382,7 +382,122 @@ def catalog_status_text() -> str:
     path = get_master_path()
     if path.exists():
         return f"{catalog_count():,} barcodes — {path.name}"
-    return "No barcode list — click Update Barcode List"
+    return "No barcode list — Super Admin publishes it from Top Pickers Monitor"
+
+
+def _cloud_stamp_path() -> Path:
+    return _data_dir() / "barcode_master_cloud.json"
+
+
+def _load_cloud_stamp() -> dict[str, Any]:
+    path = _cloud_stamp_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_cloud_stamp(meta: dict[str, Any]) -> None:
+    _data_dir().mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": str(meta.get("updated_at") or ""),
+        "sha256": str(meta.get("sha256") or ""),
+        "filename": str(meta.get("filename") or "BarcodeMasterList.xlsx"),
+        "row_count": int(meta.get("row_count") or 0),
+        "updated_by": str(meta.get("updated_by") or ""),
+    }
+    _cloud_stamp_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def publish_to_cloud(
+    source: Path | bytes,
+    *,
+    updated_by: str,
+    filename: str = "BarcodeMasterList.xlsx",
+) -> tuple[int, dict]:
+    """Import locally and publish to Firebase for all tablets.
+
+    Returns (row_count, cloud_meta).
+    """
+    from app import firebase_presence
+
+    if isinstance(source, bytes):
+        file_bytes = source
+        count = import_master_file(file_bytes, source_name=filename)
+    else:
+        path = Path(source)
+        file_bytes = path.read_bytes()
+        set_default_master_path(path)
+        count = load_from_excel(get_master_path())
+        filename = path.name or filename
+
+    meta = firebase_presence.publish_barcode_master(
+        file_bytes,
+        updated_by=updated_by,
+        filename=filename,
+        row_count=count,
+    )
+    _save_cloud_stamp(meta)
+    return count, meta
+
+
+def sync_from_cloud(*, force: bool = False) -> tuple[bool, str]:
+    """Pull the shared barcode master from Firebase when newer.
+
+    Returns (updated?, message).
+    """
+    from app import firebase_presence
+
+    if not firebase_presence.is_configured():
+        return False, "Firebase is not set up."
+
+    try:
+        meta = firebase_presence.fetch_barcode_master_meta()
+    except Exception as exc:
+        return False, str(exc)
+
+    if not meta:
+        return False, "No shared barcode master published yet."
+
+    local = _load_cloud_stamp()
+    cloud_updated = str(meta.get("updated_at") or "")
+    cloud_sha = str(meta.get("sha256") or "")
+    if (
+        not force
+        and local.get("updated_at") == cloud_updated
+        and local.get("sha256") == cloud_sha
+        and get_master_path().exists()
+        and catalog_count() > 0
+    ):
+        return False, "Barcode master already up to date."
+
+    try:
+        file_bytes, full_meta = firebase_presence.download_barcode_master_bytes()
+    except Exception as exc:
+        return False, str(exc)
+
+    count = import_master_file(
+        file_bytes,
+        source_name=str(full_meta.get("filename") or "BarcodeMasterList.xlsx"),
+    )
+    _save_cloud_stamp(full_meta if full_meta else meta)
+    return True, f"Updated barcode master — {count:,} barcodes loaded."
+
+
+def sync_from_cloud_background() -> None:
+    """Best-effort background pull of the shared barcode master."""
+    import threading
+
+    def work():
+        try:
+            sync_from_cloud(force=False)
+        except Exception:
+            pass
+
+    threading.Thread(target=work, name="barcode-cloud-sync", daemon=True).start()
 
 
 def lookup_part_no(part_no: str) -> dict[str, str] | None:

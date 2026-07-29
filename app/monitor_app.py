@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import time
-from datetime import date
+from datetime import date, datetime, time as dt_time
+from pathlib import Path
 
 import flet as ft
 
 from app import auth
+from app import barcode_catalog
 from app import database
 from app import firebase_presence
+from app import scheduled_sync
 from app.components import muted
 from app.paths import init_app_storage, logo_src
 from app.theme import BG_MAIN, FONT_FAMILY, PRIMARY, TEXT
@@ -142,6 +145,10 @@ async def main(page: ft.Page):
     database.init_db()
     auth.ensure_admins_file()
     auth.sync_with_cloud_background(force=True)
+    try:
+        barcode_catalog.sync_from_cloud_background()
+    except Exception:
+        pass
 
     page.title = "DEKS Top Pickers Monitor"
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -152,6 +159,9 @@ async def main(page: ft.Page):
     page.window.height = 800
     page.window.min_width = 900
     page.window.min_height = 640
+
+    file_picker = ft.FilePicker()
+    page.services.append(file_picker)
 
     session = {"username": None, "role": None, "view": "board"}
     body = ft.Container(expand=True, padding=28)
@@ -301,6 +311,39 @@ async def main(page: ft.Page):
             ],
         )
         settings_status = muted("")
+        barcode_status = muted(barcode_catalog.catalog_status_text())
+        barcode_cloud_status = muted("")
+        _fleet = firebase_presence.get_fleet_sync_settings()
+        fleet_enabled_switch = ft.Switch(
+            label="Enable daily backup for all tablets",
+            value=bool(_fleet.get("enabled")),
+        )
+        fleet_time_label = muted(
+            f"Scheduled time: {scheduled_sync.normalize_time(str(_fleet.get('time') or '17:00')) or '17:00'}"
+        )
+        fleet_output_dropdown = ft.Dropdown(
+            label="Backup file type",
+            width=360,
+            value=firebase_presence.normalize_fleet_output(
+                str(_fleet.get("output_mode") or "")
+            ),
+            options=[
+                ft.DropdownOption(key=key, text=label)
+                for key, label in firebase_presence.FLEET_OUTPUT_LABELS.items()
+            ],
+        )
+        fleet_date_label = muted(
+            "Report date: "
+            + firebase_presence.format_fleet_report_range(
+                str(_fleet.get("report_date_from") or ""),
+                str(_fleet.get("report_date_to") or ""),
+            )
+        )
+        fleet_folder_label = muted(
+            f"Save downloads to: {_fleet.get('download_folder') or firebase_presence.get_fleet_download_folder()}"
+        )
+        fleet_status = muted(firebase_presence.fleet_sync_status_text())
+        fleet_backup_list = ft.Column(spacing=6, tight=True)
 
         filter_state = {"value": "this", "prize": ""}
         refresh_token = time.time()
@@ -554,6 +597,17 @@ async def main(page: ft.Page):
             )
             prize_field.value = filter_state.get("prize") or ""
             settings_week_dropdown.value = filter_state.get("value") or "this"
+            barcode_status.value = barcode_catalog.catalog_status_text()
+            stamp = barcode_catalog._load_cloud_stamp()
+            if stamp.get("updated_at"):
+                barcode_cloud_status.value = (
+                    f"Last published: {stamp.get('updated_at')} "
+                    f"by {stamp.get('updated_by') or '—'}"
+                )
+            else:
+                barcode_cloud_status.value = (
+                    "Not published yet — upload an Excel file to sync tablets."
+                )
             try:
                 auth.sync_with_cloud(force=False)
             except Exception:
@@ -787,6 +841,717 @@ async def main(page: ft.Page):
 
             page.run_thread(work)
 
+        async def handle_barcode_master_pick(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can update the barcode list.", error=True)
+                return
+            files = await file_picker.pick_files(
+                dialog_title="Select Barcode Master List",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["xlsx"],
+                allow_multiple=False,
+                with_data=True,
+            )
+            if not files:
+                return
+            selected = files[0]
+            try:
+                if selected.path:
+                    count, _meta = barcode_catalog.publish_to_cloud(
+                        selected.path,
+                        updated_by=admin_name,
+                        filename=Path(selected.path).name,
+                    )
+                elif selected.bytes:
+                    count, _meta = barcode_catalog.publish_to_cloud(
+                        selected.bytes,
+                        updated_by=admin_name,
+                        filename=selected.name or "BarcodeMasterList.xlsx",
+                    )
+                else:
+                    show_snack("Could not read the selected Excel file.", error=True)
+                    return
+                barcode_status.value = barcode_catalog.catalog_status_text()
+                barcode_cloud_status.value = (
+                    f"Published to all tablets — {count:,} barcodes."
+                )
+                show_snack(
+                    f"Barcode master published — {count:,} barcodes synced to tablets."
+                )
+                page.update()
+            except (ValueError, FileNotFoundError, RuntimeError) as exc:
+                show_snack(str(exc), error=True)
+            except Exception as exc:
+                show_snack(f"Failed to publish barcode master: {exc}", error=True)
+
+        def on_update_barcode(_=None):
+            page.run_task(handle_barcode_master_pick)
+
+        def pull_barcode_now(_=None):
+            def work():
+                try:
+                    updated, message = barcode_catalog.sync_from_cloud(force=True)
+
+                    def done():
+                        barcode_status.value = barcode_catalog.catalog_status_text()
+                        barcode_cloud_status.value = message
+                        lower = message.lower()
+                        show_snack(
+                            message,
+                            error=(
+                                "fail" in lower
+                                or "denied" in lower
+                                or "could not" in lower
+                                or "not set up" in lower
+                            ),
+                        )
+                        page.update()
+
+                    done()
+                except Exception as exc:
+                    show_snack(f"Could not pull barcode list: {exc}", error=True)
+
+            page.run_thread(work)
+
+        def refresh_fleet_ui() -> None:
+            settings = firebase_presence.get_fleet_sync_settings()
+            fleet_enabled_switch.value = bool(settings.get("enabled"))
+            stamp = (
+                scheduled_sync.normalize_time(str(settings.get("time") or "17:00"))
+                or "17:00"
+            )
+            fleet_time_label.value = f"Scheduled time: {stamp}"
+            fleet_output_dropdown.value = firebase_presence.normalize_fleet_output(
+                str(settings.get("output_mode") or "")
+            )
+            fleet_date_label.value = (
+                "Report date: "
+                + firebase_presence.format_fleet_report_range(
+                    str(settings.get("report_date_from") or ""),
+                    str(settings.get("report_date_to") or ""),
+                )
+            )
+            fleet_folder_label.value = (
+                f"Save downloads to: {settings.get('download_folder') or firebase_presence.get_fleet_download_folder()}"
+            )
+            fleet_status.value = firebase_presence.fleet_sync_status_text()
+
+        def render_fleet_backups(metas: list[dict] | None = None) -> None:
+            fleet_backup_list.controls.clear()
+            rows = metas
+            if rows is None:
+                try:
+                    rows = firebase_presence.list_device_backup_metas()
+                except Exception as exc:
+                    fleet_backup_list.controls.append(
+                        muted(f"Could not load backups: {exc}")
+                    )
+                    return
+            if not rows:
+                fleet_backup_list.controls.append(
+                    muted("No tablet backups in Firebase yet.")
+                )
+                return
+            for meta in rows:
+                label = str(meta.get("device_label") or meta.get("device_id") or "?")
+                sync_date = str(meta.get("sync_date") or "?")
+                updated = str(meta.get("updated_at") or "")
+                try:
+                    if updated:
+                        updated = (
+                            datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                            .astimezone()
+                            .strftime("%d/%m/%Y %H:%M")
+                        )
+                except Exception:
+                    pass
+                size = int(meta.get("byte_count") or 0)
+                user = str(meta.get("username") or "").strip()
+                user_bit = f" · {user}" if user else ""
+                filename = str(meta.get("filename") or "").strip()
+                kind = firebase_presence.fleet_output_label(
+                    str(meta.get("output_mode") or "")
+                )
+                file_bit = f" · {filename}" if filename else f" · {kind}"
+                fleet_backup_list.controls.append(
+                    muted(
+                        f"{label}{user_bit}{file_bit} — {sync_date} · {size:,} bytes · {updated}"
+                    )
+                )
+
+        def _current_fleet_time() -> str:
+            return (
+                scheduled_sync.normalize_time(
+                    str(firebase_presence.get_fleet_sync_settings().get("time") or "17:00")
+                )
+                or "17:00"
+            )
+
+        def save_fleet_settings(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can change fleet sync.", error=True)
+                return
+            current_time = _current_fleet_time()
+            output_mode = firebase_presence.normalize_fleet_output(
+                str(fleet_output_dropdown.value or "")
+            )
+            settings_now = firebase_presence.get_fleet_sync_settings()
+            report_from, report_to = firebase_presence.normalize_fleet_report_range(
+                str(settings_now.get("report_date_from") or ""),
+                str(settings_now.get("report_date_to") or ""),
+            )
+
+            def work():
+                try:
+                    firebase_presence.save_fleet_sync_settings(
+                        enabled=bool(fleet_enabled_switch.value),
+                        sync_time=current_time,
+                        output_mode=output_mode,
+                        report_date_from=report_from,
+                        report_date_to=report_to,
+                        updated_by=admin_name,
+                    )
+
+                    def done():
+                        refresh_fleet_ui()
+                        show_snack("Fleet daily backup settings saved to Firebase.")
+                        page.update()
+
+                    done()
+                except Exception as exc:
+                    show_snack(f"Could not save fleet sync: {exc}", error=True)
+                    refresh_fleet_ui()
+                    page.update()
+
+            page.run_thread(work)
+
+        def on_fleet_switch(e):
+            if not can_edit:
+                fleet_enabled_switch.value = bool(
+                    firebase_presence.get_fleet_sync_settings().get("enabled")
+                )
+                page.update()
+                show_snack("Only Super Admin can change fleet sync.", error=True)
+                return
+            save_fleet_settings()
+
+        fleet_enabled_switch.on_change = on_fleet_switch
+
+        def on_fleet_output_change(_=None):
+            if not can_edit:
+                refresh_fleet_ui()
+                page.update()
+                show_snack("Only Super Admin can change fleet sync.", error=True)
+                return
+            save_fleet_settings()
+
+        fleet_output_dropdown.on_change = on_fleet_output_change
+
+        def open_fleet_time_picker(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can change fleet sync.", error=True)
+                return
+            current = _current_fleet_time()
+            h, m = map(int, current.split(":"))
+
+            def on_time_change(e):
+                value = e.control.value
+                if value is None:
+                    return
+                stamp = f"{value.hour:02d}:{value.minute:02d}"
+                output_mode = firebase_presence.normalize_fleet_output(
+                    str(fleet_output_dropdown.value or "")
+                )
+                settings_now = firebase_presence.get_fleet_sync_settings()
+                report_from, report_to = firebase_presence.normalize_fleet_report_range(
+                    str(settings_now.get("report_date_from") or ""),
+                    str(settings_now.get("report_date_to") or ""),
+                )
+
+                def work():
+                    try:
+                        firebase_presence.save_fleet_sync_settings(
+                            enabled=bool(fleet_enabled_switch.value),
+                            sync_time=stamp,
+                            output_mode=output_mode,
+                            report_date_from=report_from,
+                            report_date_to=report_to,
+                            updated_by=admin_name,
+                        )
+
+                        def done():
+                            refresh_fleet_ui()
+                            show_snack(f"Fleet backup time set to {stamp}.")
+                            page.update()
+
+                        done()
+                    except Exception as exc:
+                        show_snack(f"Could not save fleet sync time: {exc}", error=True)
+
+                page.run_thread(work)
+
+            picker = ft.TimePicker(
+                value=dt_time(hour=h, minute=m),
+                help_text="Daily fleet backup time",
+                confirm_text="Save",
+                cancel_text="Cancel",
+                hour_format=ft.TimePickerHourFormat.H24,
+                on_change=on_time_change,
+            )
+            page.show_dialog(picker)
+
+        def _save_report_range(date_from: str, date_to: str, *, which: str) -> None:
+            def work():
+                try:
+                    firebase_presence.save_fleet_sync_settings(
+                        enabled=bool(fleet_enabled_switch.value),
+                        sync_time=_current_fleet_time(),
+                        output_mode=firebase_presence.normalize_fleet_output(
+                            str(fleet_output_dropdown.value or "")
+                        ),
+                        report_date_from=date_from,
+                        report_date_to=date_to,
+                        updated_by=admin_name,
+                    )
+
+                    def done():
+                        refresh_fleet_ui()
+                        show_snack(
+                            f"Report date {which} set — "
+                            + firebase_presence.format_fleet_report_range(date_from, date_to)
+                        )
+                        page.update()
+
+                    done()
+                except Exception as exc:
+                    show_snack(f"Could not save report date: {exc}", error=True)
+
+            page.run_thread(work)
+
+        def open_fleet_date_from_picker(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can change the report date.", error=True)
+                return
+            settings_now = firebase_presence.get_fleet_sync_settings()
+            current_from, current_to = firebase_presence.normalize_fleet_report_range(
+                str(settings_now.get("report_date_from") or ""),
+                str(settings_now.get("report_date_to") or ""),
+            )
+            current_day = date.fromisoformat(current_from)
+
+            def on_date_change(e):
+                value = e.control.value
+                if value is None:
+                    return
+                if isinstance(value, datetime):
+                    value = value.date()
+                stamp = value.isoformat() if hasattr(value, "isoformat") else str(value)
+                _save_report_range(stamp, current_to, which="from")
+
+            picker = ft.DatePicker(
+                value=current_day,
+                help_text="Report date from",
+                confirm_text="Save",
+                cancel_text="Cancel",
+                on_change=on_date_change,
+            )
+            page.show_dialog(picker)
+
+        def open_fleet_date_to_picker(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can change the report date.", error=True)
+                return
+            settings_now = firebase_presence.get_fleet_sync_settings()
+            current_from, current_to = firebase_presence.normalize_fleet_report_range(
+                str(settings_now.get("report_date_from") or ""),
+                str(settings_now.get("report_date_to") or ""),
+            )
+            current_day = date.fromisoformat(current_to)
+
+            def on_date_change(e):
+                value = e.control.value
+                if value is None:
+                    return
+                if isinstance(value, datetime):
+                    value = value.date()
+                stamp = value.isoformat() if hasattr(value, "isoformat") else str(value)
+                _save_report_range(current_from, stamp, which="to")
+
+            picker = ft.DatePicker(
+                value=current_day,
+                help_text="Report date to",
+                confirm_text="Save",
+                cancel_text="Cancel",
+                on_change=on_date_change,
+            )
+            page.show_dialog(picker)
+
+        async def choose_fleet_download_folder(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can change the save folder.", error=True)
+                return
+            try:
+                path = await file_picker.get_directory_path(
+                    dialog_title="Choose folder for fleet backup downloads"
+                )
+            except Exception as exc:
+                show_snack(f"Folder picker failed: {exc}", error=True)
+                return
+            if not path:
+                return
+            try:
+                folder = firebase_presence.set_fleet_download_folder(path)
+                fleet_folder_label.value = f"Save downloads to: {folder}"
+                show_snack(f"Download folder set — {folder}")
+                page.update()
+            except Exception as exc:
+                show_snack(f"Could not set folder: {exc}", error=True)
+
+        def reset_fleet_download_folder(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can change the save folder.", error=True)
+                return
+            folder = firebase_presence.set_fleet_download_folder(None)
+            fleet_folder_label.value = f"Save downloads to: {folder}"
+            show_snack("Download folder reset to app default.")
+            page.update()
+
+        def refresh_fleet_backups(_=None):
+            def work():
+                try:
+                    metas = firebase_presence.list_device_backup_metas()
+
+                    def done():
+                        refresh_fleet_ui()
+                        render_fleet_backups(metas)
+                        show_snack(f"Found {len(metas)} device backup(s) in Firebase.")
+                        page.update()
+
+                    done()
+                except Exception as exc:
+                    show_snack(f"Could not refresh backups: {exc}", error=True)
+
+            page.run_thread(work)
+
+        def _backup_in_report_range(meta: dict, date_from: str, date_to: str) -> bool:
+            start, end = firebase_presence.normalize_fleet_report_range(date_from, date_to)
+            start_d = date.fromisoformat(start)
+            end_d = date.fromisoformat(end)
+            legacy = str(meta.get("report_date") or meta.get("sync_date") or "").strip()
+            meta_from = str(meta.get("report_date_from") or legacy or "").strip()
+            meta_to = str(meta.get("report_date_to") or legacy or "").strip()
+            if not meta_from and not meta_to:
+                return True
+            m_from, m_to = firebase_presence.normalize_fleet_report_range(meta_from, meta_to)
+            a = date.fromisoformat(m_from)
+            b = date.fromisoformat(m_to)
+            return a <= end_d and b >= start_d
+
+        def _download_all_backups_to_folder(
+            *,
+            report_date_from: str | None = None,
+            report_date_to: str | None = None,
+        ) -> tuple[int, Path, list[dict]]:
+            metas = firebase_presence.list_device_backup_metas()
+            out_dir = firebase_presence.get_fleet_download_folder()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if report_date_from or report_date_to:
+                wanted_from, wanted_to = firebase_presence.normalize_fleet_report_range(
+                    report_date_from, report_date_to
+                )
+                metas = [
+                    m
+                    for m in metas
+                    if _backup_in_report_range(m, wanted_from, wanted_to)
+                ]
+            if not metas:
+                return 0, out_dir, []
+            saved = 0
+            for meta in metas:
+                device_id = str(meta.get("device_id") or "").strip()
+                if not device_id:
+                    continue
+                raw, detail = firebase_presence.download_device_scanner_backup(device_id)
+                label = str(detail.get("device_label") or device_id).strip() or device_id
+                safe = "".join(
+                    ch if ch.isalnum() or ch in "-_" else "_" for ch in label
+                )[:40]
+                sync_date = str(detail.get("sync_date") or detail.get("report_date") or "unknown")
+                filename = str(detail.get("filename") or "scanner.db").strip()
+                suffix = Path(filename).suffix or ".db"
+                stem = Path(filename).stem or "backup"
+                safe_stem = "".join(
+                    ch if ch.isalnum() or ch in "-_" else "_" for ch in stem
+                )[:50]
+                path = (
+                    out_dir / f"{safe}_{sync_date}_{safe_stem}_{device_id[:8]}{suffix}"
+                )
+                path.write_bytes(raw)
+                saved += 1
+            return saved, out_dir, metas
+
+        def download_fleet_backups(_=None):
+            if not can_edit:
+                show_snack("Only Super Admin can download backups.", error=True)
+                return
+
+            def work():
+                try:
+                    settings_now = firebase_presence.get_fleet_sync_settings()
+                    report_from, report_to = firebase_presence.normalize_fleet_report_range(
+                        str(settings_now.get("report_date_from") or ""),
+                        str(settings_now.get("report_date_to") or ""),
+                    )
+                    saved, out_dir, metas = _download_all_backups_to_folder(
+                        report_date_from=report_from,
+                        report_date_to=report_to,
+                    )
+                    if saved <= 0:
+                        show_snack(
+                            "No backups for "
+                            + firebase_presence.format_fleet_report_range(
+                                report_from, report_to
+                            )
+                            + "."
+                        )
+                        return
+
+                    def done():
+                        render_fleet_backups(metas)
+                        show_snack(f"Downloaded {saved} backup(s) to {out_dir}")
+                        page.update()
+
+                    done()
+                except Exception as exc:
+                    show_snack(f"Download failed: {exc}", error=True)
+
+            show_snack("Downloading tablet backups…")
+            page.run_thread(work)
+
+        def force_download_now(_=None):
+            """Bypass schedule: ask tablets to upload for report date, then save to folder."""
+            if not can_edit:
+                show_snack("Only Super Admin can force download.", error=True)
+                return
+
+            def work():
+                try:
+                    settings_now = firebase_presence.get_fleet_sync_settings()
+                    report_from, report_to = firebase_presence.normalize_fleet_report_range(
+                        str(settings_now.get("report_date_from") or ""),
+                        str(settings_now.get("report_date_to") or ""),
+                    )
+                    firebase_presence.request_fleet_force_sync(
+                        updated_by=admin_name,
+                        report_date_from=report_from,
+                        report_date_to=report_to,
+                    )
+                    # Give open tablets a moment, then pull whatever is already available.
+                    time.sleep(2)
+                    saved, out_dir, metas = _download_all_backups_to_folder(
+                        report_date_from=report_from,
+                        report_date_to=report_to,
+                    )
+                    day_label = firebase_presence.format_fleet_report_range(
+                        report_from, report_to
+                    )
+
+                    def done():
+                        refresh_fleet_ui()
+                        render_fleet_backups(metas)
+                        if saved <= 0:
+                            show_snack(
+                                f"Force requested for {day_label}. No backups in Firebase yet — "
+                                "leave tablets open, wait ~30s, then Force download again."
+                            )
+                        else:
+                            show_snack(
+                                f"Force download complete — {saved} file(s) for {day_label} "
+                                f"saved to {out_dir}. Open tablets upload within ~30s; "
+                                "click again to pull them."
+                            )
+                        page.update()
+
+                    done()
+                except Exception as exc:
+                    show_snack(f"Force download failed: {exc}", error=True)
+
+            show_snack("Force download — requesting tablets and saving to folder…")
+            page.run_thread(work)
+
+        def fleet_section() -> ft.Control:
+            return ft.Container(
+                bgcolor=ft.Colors.WHITE,
+                border_radius=10,
+                padding=20,
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Fleet data sync",
+                            weight=ft.FontWeight.W_600,
+                            font_family=FONT_FAMILY,
+                        ),
+                        muted(
+                            "Schedule time controls when open tablets auto-upload. "
+                            "File type is the output format. Report date is separate — "
+                            "use it for Force download / PDF & JSON (which day's sessions). "
+                            "Daily scheduled uploads still use each tablet's local today."
+                        ),
+                        fleet_enabled_switch,
+                        fleet_time_label,
+                        fleet_output_dropdown,
+                        fleet_date_label,
+                        fleet_folder_label,
+                        fleet_status,
+                        ft.Row(
+                            [
+                                ft.OutlinedButton(
+                                    "Set time",
+                                    icon=ft.Icons.SCHEDULE,
+                                    height=48,
+                                    on_click=open_fleet_time_picker,
+                                ),
+                                ft.OutlinedButton(
+                                    "Set date from",
+                                    icon=ft.Icons.CALENDAR_MONTH,
+                                    height=48,
+                                    on_click=open_fleet_date_from_picker,
+                                ),
+                                ft.OutlinedButton(
+                                    "Set date to",
+                                    icon=ft.Icons.EVENT,
+                                    height=48,
+                                    on_click=open_fleet_date_to_picker,
+                                ),
+                                ft.ElevatedButton(
+                                    "Save schedule",
+                                    icon=ft.Icons.SAVE,
+                                    bgcolor=PRIMARY,
+                                    color=ft.Colors.WHITE,
+                                    height=48,
+                                    on_click=save_fleet_settings,
+                                ),
+                                ft.OutlinedButton(
+                                    "Choose save folder",
+                                    icon=ft.Icons.FOLDER_OPEN,
+                                    height=48,
+                                    on_click=lambda _: page.run_task(
+                                        choose_fleet_download_folder
+                                    ),
+                                ),
+                                ft.TextButton(
+                                    "Reset folder",
+                                    on_click=reset_fleet_download_folder,
+                                ),
+                            ],
+                            spacing=10,
+                            wrap=True,
+                        ),
+                        ft.Row(
+                            [
+                                ft.ElevatedButton(
+                                    "Force download now",
+                                    icon=ft.Icons.DOWNLOAD_FOR_OFFLINE,
+                                    bgcolor="#C62828",
+                                    color=ft.Colors.WHITE,
+                                    height=48,
+                                    on_click=force_download_now,
+                                ),
+                            ],
+                            spacing=10,
+                            wrap=True,
+                        ),
+                        muted(
+                            "Force download now asks open tablets to upload for the "
+                            "selected report date range (does not wait for the schedule), "
+                            "then saves matching backups into your save folder."
+                        ),
+                        ft.Text(
+                            "Backups in Firebase",
+                            size=13,
+                            weight=ft.FontWeight.W_600,
+                            font_family=FONT_FAMILY,
+                        ),
+                        fleet_backup_list,
+                        ft.Row(
+                            [
+                                ft.OutlinedButton(
+                                    "Refresh list",
+                                    icon=ft.Icons.REFRESH,
+                                    height=48,
+                                    on_click=refresh_fleet_backups,
+                                ),
+                                ft.OutlinedButton(
+                                    "Download all to save folder",
+                                    icon=ft.Icons.DOWNLOAD,
+                                    height=48,
+                                    on_click=download_fleet_backups,
+                                ),
+                            ],
+                            spacing=10,
+                            wrap=True,
+                        ),
+                    ],
+                    spacing=10,
+                    tight=True,
+                ),
+            )
+
+        try:
+            render_fleet_backups([])
+        except Exception:
+            pass
+
+        def barcode_section() -> ft.Control:
+            return ft.Container(
+                bgcolor=ft.Colors.WHITE,
+                border_radius=10,
+                padding=20,
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Barcode Master List",
+                            weight=ft.FontWeight.W_600,
+                            font_family=FONT_FAMILY,
+                        ),
+                        muted(
+                            "Upload BarcodeMasterList.xlsx here. It is published to Firebase "
+                            "and every tablet downloads it automatically."
+                        ),
+                        ft.Text(
+                            "Current local catalog",
+                            size=13,
+                            weight=ft.FontWeight.W_600,
+                            font_family=FONT_FAMILY,
+                        ),
+                        barcode_status,
+                        barcode_cloud_status,
+                        ft.Row(
+                            [
+                                ft.ElevatedButton(
+                                    "Upload & publish to tablets",
+                                    icon=ft.Icons.UPLOAD_FILE,
+                                    bgcolor=PRIMARY,
+                                    color=ft.Colors.WHITE,
+                                    height=48,
+                                    on_click=on_update_barcode,
+                                ),
+                                ft.OutlinedButton(
+                                    "Pull latest from Firebase",
+                                    icon=ft.Icons.CLOUD_DOWNLOAD,
+                                    height=48,
+                                    on_click=pull_barcode_now,
+                                ),
+                            ],
+                            spacing=10,
+                            wrap=True,
+                        ),
+                    ],
+                    spacing=10,
+                    tight=True,
+                ),
+            )
+
         def users_section() -> ft.Control:
             account_rows = ft.Column(spacing=4)
             try:
@@ -1001,6 +1766,8 @@ async def main(page: ft.Page):
                             tight=True,
                         ),
                     ),
+                    fleet_section(),
+                    barcode_section(),
                     users_section(),
                     ft.TextButton(
                         "Back to board",

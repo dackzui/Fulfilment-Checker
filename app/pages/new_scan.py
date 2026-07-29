@@ -18,7 +18,6 @@ from app.components import (
     capitalize_person_name,
     labeled_field,
     muted,
-    person_name_dropdown,
     section_title,
     text_input,
 )
@@ -96,89 +95,7 @@ def build(
     ITEMS_LIST_HEIGHT = max(260, ITEMS_PANEL_HEIGHT - 72)
     ITEMS_LIST_BODY_HEIGHT = max(200, ITEMS_LIST_HEIGHT - LIST_HEADER_HEIGHT)
 
-    picker = person_name_dropdown(
-        hint="Select picker",
-        options=auth.list_picker_usernames(),
-    )
-
-    def refresh_picker_options(*, keep_value: bool = True, sync: bool = False):
-        current = capitalize_person_name(picker.value or "") if keep_value else ""
-        # Always paint from local cache first; optional sync runs in the background.
-        names = list(auth.list_picker_usernames(sync=False))
-        if sync:
-            def work():
-                try:
-                    auth.sync_with_cloud(force=False)
-                except Exception:
-                    pass
-
-                def apply():
-                    refresh_picker_options(keep_value=True, sync=False)
-                    apply_default_picker()
-                    try:
-                        page.update()
-                    except Exception:
-                        pass
-
-                page.run_thread(apply)
-
-            page.run_thread(work)
-
-        matched = auth.match_picker_username(current) if current else None
-        if matched and matched not in names:
-            names.append(matched)
-            names.sort(key=str.casefold)
-        picker.options = [
-            ft.dropdown.Option(key=name, text=name) for name in names
-        ]
-        if matched:
-            picker.value = matched
-        elif current and current in names:
-            picker.value = current
-        elif not keep_value:
-            picker.value = None
-        # Only update after the dropdown is on the page (avoids Flet startup crash).
-        try:
-            if picker.page is not None:
-                picker.update()
-        except Exception:
-            pass
-
-    def remember_picker_from_field():
-        name = auth.match_picker_username(picker.value or "")
-        if not name:
-            return
-        from app import firebase_presence
-
-        picker.value = name
-        firebase_presence.set_default_picker(name)
-        refresh_picker_options(keep_value=True, sync=False)
-
-    def on_picker_blur(_=None):
-        matched = auth.match_picker_username(picker.value or "")
-        if matched:
-            picker.value = matched
-            remember_picker_from_field()
-        elif picker.value:
-            picker.value = capitalize_person_name(picker.value)
-
-    def apply_default_picker():
-        from app import firebase_presence
-
-        username, role = current_session()
-        if role == auth.ROLE_PICKER and username:
-            picker.value = capitalize_person_name(username)
-            refresh_picker_options(keep_value=True)
-            return
-
-        default = firebase_presence.get_default_picker()
-        if not default:
-            return
-        matched = auth.match_picker_username(default)
-        if not matched:
-            return
-        picker.value = matched
-        refresh_picker_options(keep_value=True)
+    picker = text_input(hint="Sign in to assign picker", value="", read_only=True)
 
     def current_session() -> tuple[str | None, str | None]:
         if get_logged_in:
@@ -196,6 +113,47 @@ def build(
     def session_is_logged_in() -> bool:
         username, _ = current_session()
         return bool(username)
+
+    def assign_picker_from_login() -> str:
+        """Always use the signed-in user as picker (no manual selection)."""
+        from app import firebase_presence
+
+        username, _ = current_session()
+        name = capitalize_person_name(username or "")
+        picker.value = name
+        if name:
+            try:
+                firebase_presence.set_default_picker(name)
+            except Exception:
+                pass
+        try:
+            if picker.page is not None:
+                picker.update()
+        except Exception:
+            pass
+        return name
+
+    def refresh_picker_from_login(*, sync: bool = False):
+        assign_picker_from_login()
+        if not sync:
+            return
+
+        def work():
+            try:
+                auth.sync_with_cloud(force=False)
+            except Exception:
+                pass
+
+            def apply():
+                assign_picker_from_login()
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+            page.run_thread(apply)
+
+        page.run_thread(work)
 
     login_dialog_open = False
 
@@ -224,8 +182,7 @@ def build(
                 show_snack("Invalid username or password.", error=True)
                 return
             close_dialog()
-            refresh_picker_options(keep_value=True, sync=False)
-            apply_default_picker()
+            assign_picker_from_login()
             page.update()
             username, role = current_session()
             role_label = auth.ROLE_LABELS.get(role or "", role or "")
@@ -426,10 +383,6 @@ def build(
         field.on_focus = on_focus
         field.on_blur = on_blur
 
-    wire_manual_entry_field(
-        picker,
-        on_blur_extra=on_picker_blur,
-    )
     wire_manual_entry_field(sales_order)
     wire_manual_entry_field(no_of_boxes)
     wire_manual_entry_field(manual_part_field)
@@ -1036,28 +989,15 @@ def build(
         pdf_label.value = "No picking ticket loaded"
         refresh_expected_table()
 
-    def _normalize_person_names():
-        matched = auth.match_picker_username(picker.value or "")
-        if matched:
-            picker.value = matched
-        else:
-            picker.value = capitalize_person_name(picker.value)
-        remember_picker_from_field()
-
     def _validate_basic_fields() -> bool:
         if not session_is_logged_in():
             open_login_dialog()
             return False
-        _normalize_person_names()
-        matched = auth.match_picker_username(picker.value or "")
-        if not matched:
-            show_snack(
-                "Select a Picker from the list (add Picker users in Settings).",
-                error=True,
-            )
-            focus_field(picker)
+        picker_name = assign_picker_from_login()
+        if not picker_name:
+            show_snack("Sign in required — picker is assigned from the login user.", error=True)
+            open_login_dialog()
             return False
-        picker.value = matched
         if not sales_order.value or not sales_order.value.strip():
             show_snack("Sales Order No. is required.", error=True)
             focus_field(sales_order)
@@ -1097,7 +1037,7 @@ def build(
 
         stamp_check_datetime()
         draft_session_id = database.save_session(
-            picker_name=picker.value,
+            picker_name=assign_picker_from_login(),
             checker_name=resolved_checker_name(),
             check_date=check_date.value or today,
             check_time=check_time.value or "",
@@ -1108,8 +1048,6 @@ def build(
             session_id=draft_session_id,
             status="draft",
         )
-        remember_picker_from_field()
-        refresh_picker_options()
         show_snack(f"Saved — resume later to enter No of Boxes (checking #{draft_session_id}).")
 
     def reset_form():
@@ -1117,8 +1055,7 @@ def build(
         scanned_items.clear()
         draft_session_id = None
         clear_ticket()
-        picker.value = ""
-        apply_default_picker()
+        assign_picker_from_login()
         check_date.value = today
         check_time.value = ""
         sales_order.value = ""
@@ -1142,7 +1079,7 @@ def build(
 
         stamp_check_datetime()
         session_id = database.save_session(
-            picker_name=picker.value,
+            picker_name=assign_picker_from_login(),
             checker_name=resolved_checker_name(),
             check_date=check_date.value or today,
             check_time=check_time.value or "",
@@ -1153,7 +1090,6 @@ def build(
             session_id=draft_session_id,
             status="completed",
         )
-        remember_picker_from_field()
         show_snack(f"Scan completed — checking #{session_id} saved.")
         navigate("history", session_id=session_id)
 
@@ -1213,7 +1149,7 @@ def build(
                                     font_family=FONT_FAMILY,
                                 ),
                                 muted(
-                                    "Same list as Picker users in Settings (synced on all tablets)."
+                                    "Assigned automatically from the signed-in user."
                                 ),
                                 picker,
                             ],
@@ -1445,10 +1381,7 @@ def build(
             return
 
         draft_session_id = session_id
-        refresh_picker_options(keep_value=False, sync=False)
-        matched = auth.match_picker_username(session["picker_name"])
-        picker.value = matched or capitalize_person_name(session["picker_name"])
-        refresh_picker_options(keep_value=True, sync=True)
+        assign_picker_from_login()
         check_date.value = session["check_date"]
         check_time.value = session.get("check_time") or ""
         sales_order.value = session["sales_order_no"]
@@ -1483,14 +1416,19 @@ def build(
         show_snack(f"Resumed saved checking #{session_id}.")
 
     def post_build():
+        try:
+            barcode_catalog.sync_from_cloud_background()
+        except Exception:
+            pass
         if resume_session_id:
             load_draft(resume_session_id)
         else:
-            refresh_picker_options(keep_value=True, sync=True)
-            apply_default_picker()
+            refresh_picker_from_login(sync=True)
             refresh_verification_status()
         if not session_is_logged_in():
             open_login_dialog()
+        else:
+            assign_picker_from_login()
         focus_scan_field()
 
     if scan_focus is not None:
