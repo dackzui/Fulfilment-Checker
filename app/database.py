@@ -178,7 +178,14 @@ def save_session(
 
     with _connect() as conn:
         _migrate(conn)
+        was_completed = False
         if session_id:
+            prev = conn.execute(
+                "SELECT status FROM scan_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if prev is not None:
+                was_completed = str(prev["status"] or "") == "completed"
             conn.execute(
                 """
                 UPDATE scan_sessions SET
@@ -242,7 +249,20 @@ def save_session(
                 (sid, *_item_row(item)),
             )
         _remember_picker_name(conn, picker_name)
-        return sid
+
+    if status == "completed" and not was_completed:
+        try:
+            from app import analytics
+
+            analytics.track_pick_completed(
+                picker_name=picker_name,
+                sales_order_no=sales_order_no,
+                session_id=int(sid) if sid is not None else None,
+                username=checker_name,
+            )
+        except Exception:
+            pass
+    return sid
 
 
 def list_sessions(limit: int = 100, *, status: str | None = None) -> list[dict[str, Any]]:

@@ -1,5 +1,7 @@
 {
   "api_key": "YOUR_WEB_API_KEY",
   "database_url": "https://YOUR_PROJECT_ID-default-rtdb.REGION.firebasedatabase.app",
-  "project_id": "YOUR_PROJECT_ID"
+  "project_id": "YOUR_PROJECT_ID",
+  "ga_measurement_id": "G-XXXXXXXXXX",
+  "ga_api_secret": "YOUR_MEASUREMENT_PROTOCOL_API_SECRET"
 }

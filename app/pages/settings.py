@@ -578,6 +578,19 @@ def build(
             value=cfg.get("project_id") or "",
             dense=True,
         )
+        ga_measurement_id = ft.TextField(
+            label="Google Analytics Measurement ID (optional)",
+            value=cfg.get("ga_measurement_id") or "",
+            dense=True,
+            hint_text="G-XXXXXXXXXX",
+        )
+        ga_api_secret = ft.TextField(
+            label="GA4 Measurement Protocol API secret (optional)",
+            value=cfg.get("ga_api_secret") or "",
+            dense=True,
+            password=True,
+            can_reveal_password=True,
+        )
 
         def close_dialog(_=None):
             page.pop_dialog()
@@ -588,11 +601,17 @@ def build(
                     api_key=api_key.value or "",
                     database_url=database_url.value or "",
                     project_id=project_id.value or "",
+                    ga_measurement_id=ga_measurement_id.value or "",
+                    ga_api_secret=ga_api_secret.value or "",
                 )
                 page.pop_dialog()
                 presence_status.value = firebase_presence.presence_status_text()
                 page.update()
-                show_snack("Firebase settings saved.")
+                from app import analytics
+
+                show_snack(
+                    "Firebase settings saved. " + analytics.status_text()
+                )
                 refresh_presence()
             except Exception as exc:
                 show_snack(str(exc), error=True)
@@ -611,11 +630,17 @@ def build(
                         api_key,
                         database_url,
                         project_id,
+                        muted(
+                            "Optional — Google Analytics 4 (daily active tablets + "
+                            "completed picks). See docs/FIREBASE_SETUP.md § Google Analytics."
+                        ),
+                        ga_measurement_id,
+                        ga_api_secret,
                     ],
                     tight=True,
                     spacing=10,
                     width=440,
-                    height=360,
+                    height=480,
                     scroll=ft.ScrollMode.AUTO,
                 ),
                 actions=[

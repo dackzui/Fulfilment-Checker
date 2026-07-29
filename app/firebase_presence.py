@@ -305,12 +305,14 @@ def delete_picker_name_synced(name: str) -> None:
 
 
 def resolve_config() -> dict[str, str]:
-    """Return api_key, database_url, project_id (empty strings if unset)."""
+    """Return api_key, database_url, project_id, and optional GA4 fields."""
     file_cfg = _load_json(_config_path())
     return {
         "api_key": str(file_cfg.get("api_key") or "").strip(),
         "database_url": str(file_cfg.get("database_url") or "").strip().rstrip("/"),
         "project_id": str(file_cfg.get("project_id") or "").strip(),
+        "ga_measurement_id": str(file_cfg.get("ga_measurement_id") or "").strip(),
+        "ga_api_secret": str(file_cfg.get("ga_api_secret") or "").strip(),
     }
 
 
@@ -319,7 +321,14 @@ def is_configured() -> bool:
     return bool(cfg["api_key"] and cfg["database_url"])
 
 
-def save_config(*, api_key: str, database_url: str, project_id: str = "") -> None:
+def save_config(
+    *,
+    api_key: str,
+    database_url: str,
+    project_id: str = "",
+    ga_measurement_id: str | None = None,
+    ga_api_secret: str | None = None,
+) -> None:
     api_key = (api_key or "").strip()
     database_url = (database_url or "").strip().rstrip("/")
     project_id = (project_id or "").strip()
@@ -327,14 +336,28 @@ def save_config(*, api_key: str, database_url: str, project_id: str = "") -> Non
         raise ValueError("api_key and database_url are required.")
     if not database_url.startswith("https://"):
         raise ValueError("database_url must start with https://")
-    _save_json(
-        _config_path(),
-        {
-            "api_key": api_key,
-            "database_url": database_url,
-            "project_id": project_id,
-        },
-    )
+
+    existing = _load_json(_config_path())
+    if ga_measurement_id is None:
+        ga_mid = str(existing.get("ga_measurement_id") or "").strip()
+    else:
+        ga_mid = (ga_measurement_id or "").strip()
+    if ga_api_secret is None:
+        ga_secret = str(existing.get("ga_api_secret") or "").strip()
+    else:
+        ga_secret = (ga_api_secret or "").strip()
+
+    payload = {
+        "api_key": api_key,
+        "database_url": database_url,
+        "project_id": project_id,
+    }
+    if ga_mid:
+        payload["ga_measurement_id"] = ga_mid
+    if ga_secret:
+        payload["ga_api_secret"] = ga_secret
+
+    _save_json(_config_path(), payload)
     # Force re-auth with new project.
     cache = _auth_cache_path()
     if cache.exists():
@@ -520,6 +543,18 @@ def publish_heartbeat(
     )
     if resp.status_code >= 400:
         raise RuntimeError(_firebase_error(resp, "Presence update failed"))
+
+    # Google Analytics (optional) — daily active tablet + session.
+    if online:
+        try:
+            from app import analytics
+
+            analytics.track_tablet_active(
+                username=username,
+                device_label=get_device_label(),
+            )
+        except Exception:
+            pass
 
 
 def mark_offline(*, username: str | None = None, role: str | None = None) -> None:

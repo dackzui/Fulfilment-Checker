@@ -166,3 +166,34 @@ A device counts as **Online** if it sent a heartbeat within about **90 seconds**
 ## Privacy note
 
 Presence data is only in **your** Firebase project. DEKS controls the Google account that owns the project. Warehouse staff never need Firebase Console access after setup.
+
+---
+
+## 8. Google Analytics 4 (optional)
+
+Presence (“Who’s online”) stays in Firebase. **Daily active tablets** and **completed picks per picker** can also go to **Google Analytics 4** via the Measurement Protocol.
+
+### What the app sends
+
+| Event | When | Useful for |
+|-------|------|------------|
+| `tablet_active` (+ `session_start`) | Once per local day when a device heartbeats online | Daily active tablets |
+| `pick_completed` | When a scan session is saved as completed (first time only) | Completed picks per picker (`picker_name`) |
+
+### Setup in Google Analytics / Firebase
+
+1. Open [Google Analytics](https://analytics.google.com/) (or Firebase Console → Analytics) for the same project.
+2. Note the **Measurement ID** (`G-XXXXXXXXXX`) — Admin → Data streams → your stream.
+3. Create a **Measurement Protocol API secret**: Admin → Data streams → your stream → Measurement Protocol API secrets → Create.
+4. In the app: **Settings → Firebase setup** (Super Admin), paste:
+   - Google Analytics Measurement ID
+   - GA4 Measurement Protocol API secret  
+   Or add the same keys to `data/firebase_config.json` on each tablet/PC (see `firebase_config.json.example`).
+5. Complete one pick and leave a tablet online for a heartbeat. Events can take **up to 24–48 hours** to appear in standard reports; use **Admin → DebugView** (or Realtime) sooner if testing.
+
+### Example Explorations / reports
+
+- **Daily active tablets:** Event count for `tablet_active` (or Active users) by day.
+- **Completed picks per picker:** Event count for `pick_completed`, breakdown by event parameter `picker_name`.
+
+Events are sent over HTTPS from the device; they do not appear in the in-app “Who’s online” list.
