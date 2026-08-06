@@ -278,7 +278,7 @@ def _extract_joined_entries(lines: list[str]) -> list[PickEntry]:
                 PickEntry(
                     pick=_normalize_pick_bay(pick_bay),
                     part_no=part_number.strip(),
-                    qty_committed=qty.strip(),
+                    qty_committed=qty.replace(",", "").strip(),
                 )
             )
     return entries

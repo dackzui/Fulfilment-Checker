@@ -15,15 +15,17 @@ ORDER_RE = re.compile(r"Order Number\s*:\s*(\S+)", re.IGNORECASE)
 ORDER_DATE_RE = re.compile(r"Order Date\s*:\s*(.+)", re.IGNORECASE)
 SHIP_DATE_RE = re.compile(r"Ship Date\s*:\s*(.+)", re.IGNORECASE)
 ADDRESS_SPLIT_X = 185
+# Qty columns may include thousands separators (e.g. 3,000).
+_QTY_RE = r"[\d,]+"
 JOINED_ITEM_RE = re.compile(
     # Layout: PICK[bay_prefix] <Part #> <Description> EA <Ordered> <Committed> <B/O>
     # Bay may start glued to PICK (PICK13) and finish on the next line (09 -> 1309).
     r"^PICK(?P<bay_prefix>\d*)\s+(?P<part_no>[A-Z0-9\-/]+)\s+(?P<description>.+?)\s+"
-    r"EA\s+(?P<qty_ordered>\d+)\s+(?P<qty>\d+)\s+(?P<qty_bo>\d+)\s*$",
+    rf"EA\s+(?P<qty_ordered>{_QTY_RE})\s+(?P<qty>{_QTY_RE})\s+(?P<qty_bo>{_QTY_RE})\s*$",
     re.IGNORECASE,
 )
 ITEM_LINE_RE = re.compile(
-    r"^PICK(?P<bay_prefix>\d*)\s+(\S+)\s+(.+?)\s+EA\s+\d+\s+(\d+)\s+\d+\s*$",
+    rf"^PICK(?P<bay_prefix>\d*)\s+(\S+)\s+(.+?)\s+EA\s+{_QTY_RE}\s+({_QTY_RE})\s+{_QTY_RE}\s*$",
     re.IGNORECASE,
 )
 # Leading bin fragment on a follow-on line, optionally with description text after it.
@@ -198,13 +200,25 @@ def _words_to_multiline(words: list[dict]) -> str:
     return "\n".join(" ".join(lines[top]) for top in sorted(lines))
 
 
+def _parse_qty(text: str) -> int:
+    """Parse ticket qty values that may include thousands separators."""
+    cleaned = (text or "").replace(",", "").strip()
+    if not cleaned:
+        return 0
+    return int(cleaned)
+
+
 def _looks_like_item_line(line: str) -> bool:
     stripped = line.strip()
     if ITEM_LINE_RE.match(stripped):
         return True
     return bool(
         re.match(r"^PICK\d+\s+\S+", stripped, re.IGNORECASE)
-        and re.search(r"\s+EA\s+\d+\s+\d+\s+\d+\s*$", stripped, re.IGNORECASE)
+        and re.search(
+            rf"\s+EA\s+{_QTY_RE}\s+{_QTY_RE}\s+{_QTY_RE}\s*$",
+            stripped,
+            re.IGNORECASE,
+        )
     )
 
 
@@ -350,7 +364,7 @@ def parse_picking_ticket(
             PickingTicketItem(
                 part_no=part_no.strip(),
                 description=description.strip(),
-                qty_ordered=int(qty_text),  # Qty Committed
+                qty_ordered=_parse_qty(qty_text),  # Qty Committed
                 pick_bay=pick_bay,
             )
         )
