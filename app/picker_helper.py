@@ -220,16 +220,26 @@ def _extract_ea_entries(lines: list[str]) -> list[PickEntry]:
         for j in range(i - 1, i - 10, -1):
             if j < 0:
                 break
-            if "PICK" not in lines[j]:
+            upper = lines[j].upper()
+            if "PICK" not in upper and "BAY" not in upper:
                 continue
             pick_line = lines[j].strip()
-            if pick_line.startswith("PICK ") and len(pick_line.split()) > 1:
+            pick_upper = pick_line.upper()
+            if (
+                (pick_upper.startswith("PICK ") or pick_upper.startswith("BAY "))
+                and len(pick_line.split()) > 1
+            ):
                 bin_text = pick_line.split(" ", 1)[1].strip()
                 bin_value = bin_text.split()[0]
-            elif pick_line.strip() == "PICK" and j + 1 < len(lines):
+            elif pick_upper in ("PICK", "BAY") and j + 1 < len(lines):
                 bin_value = _read_multiline_bin_value(lines, j + 1)
-            elif pick_line.startswith("PICK") and len(pick_line) > 4 and j + 1 < len(lines):
-                pick_suffix = pick_line[4:].strip()
+            elif (
+                (pick_upper.startswith("PICK") or pick_upper.startswith("BAY"))
+                and len(pick_line) > 4
+                and j + 1 < len(lines)
+            ):
+                prefix_len = 4 if pick_upper.startswith("PICK") else 3
+                pick_suffix = pick_line[prefix_len:].strip()
                 if pick_suffix:
                     first_line = (pick_suffix + lines[j + 1].strip()).strip()
                     bin_value = _read_multiline_bin_value(
