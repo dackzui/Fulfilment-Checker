@@ -37,7 +37,7 @@ SET_QTY_HEADERS = {"setqty", "set qty", "set_qty"}
 BOX_QTY_HEADERS = {"boxqty", "box qty", "box_qty", "carton/qty", "single /qty", "single/qty"}
 PALLET_QTY_HEADERS = {"palletqty", "pallet qty", "pallet_qty"}
 
-CATALOG_SCHEMA_VERSION = "3"
+CATALOG_SCHEMA_VERSION = "4"
 
 
 def _load_config() -> dict[str, Any]:
@@ -364,6 +364,31 @@ def import_master_file(
     return load_from_excel(master_path)
 
 
+def _excel_set_qty_count(path: Path) -> int:
+    """Count rows with a positive SetQty in the master Excel (best-effort)."""
+    try:
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        worksheet = workbook.active
+        rows_iter = worksheet.iter_rows(values_only=True)
+        headers = list(next(rows_iter, []))
+        columns = _column_map(headers)
+        set_idx = columns.get("set_qty")
+        if set_idx is None:
+            workbook.close()
+            return 0
+        count = 0
+        for row in rows_iter:
+            if not row or set_idx >= len(row):
+                continue
+            value = _cell_int(row[set_idx])
+            if value is not None and value > 0:
+                count += 1
+        workbook.close()
+        return count
+    except Exception:
+        return 0
+
+
 def ensure_loaded() -> int:
     path = get_master_path()
     if not path.exists():
@@ -387,9 +412,16 @@ def ensure_loaded() -> int:
         schema_row = conn.execute(
             "SELECT value FROM app_metadata WHERE key = 'catalog_schema_version'"
         ).fetchone()
-        # Old installs may lack set_qty until reload — never trust a stale cache.
         has_set_column = "set_qty" in columns
-        if (
+        set_rows = 0
+        if has_set_column:
+            set_rows = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS c FROM barcode_master "
+                    "WHERE set_qty IS NOT NULL AND set_qty > 0"
+                ).fetchone()["c"]
+            )
+        cache_ok = (
             has_set_column
             and count_row
             and int(count_row["value"]) > 0
@@ -397,7 +429,11 @@ def ensure_loaded() -> int:
             and mtime_row["value"] == file_mtime
             and schema_row
             and schema_row["value"] == CATALOG_SCHEMA_VERSION
-        ):
+        )
+        # Stale DBs can keep schema/mtime while SetQty never loaded (shows qty 1).
+        if cache_ok and set_rows == 0 and _excel_set_qty_count(path) > 0:
+            cache_ok = False
+        if cache_ok:
             return int(count_row["value"])
 
     return load_from_excel(path)
