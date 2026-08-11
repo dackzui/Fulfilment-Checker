@@ -46,6 +46,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE scan_items ADD COLUMN match_status TEXT")
     if "box_qty" not in item_cols:
         conn.execute("ALTER TABLE scan_items ADD COLUMN box_qty INTEGER")
+    if "set_qty" not in item_cols:
+        conn.execute("ALTER TABLE scan_items ADD COLUMN set_qty INTEGER")
     if "pallet_qty" not in item_cols:
         conn.execute("ALTER TABLE scan_items ADD COLUMN pallet_qty INTEGER")
 
@@ -135,6 +137,7 @@ def init_db() -> None:
                 description TEXT,
                 qty INTEGER NOT NULL DEFAULT 1,
                 match_status TEXT,
+                set_qty INTEGER,
                 box_qty INTEGER,
                 pallet_qty INTEGER,
                 FOREIGN KEY (session_id) REFERENCES scan_sessions(id)
@@ -152,6 +155,7 @@ def _item_row(item: dict[str, Any]) -> tuple:
         item.get("description", ""),
         int(item.get("qty", 1)),
         item.get("match_status", ""),
+        item.get("set_qty"),
         item.get("box_qty"),
         item.get("pallet_qty"),
     )
@@ -243,8 +247,8 @@ def save_session(
                 """
                 INSERT INTO scan_items (
                     session_id, item_scanned, part_no, description, qty,
-                    match_status, box_qty, pallet_qty
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    match_status, set_qty, box_qty, pallet_qty
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (sid, *_item_row(item)),
             )

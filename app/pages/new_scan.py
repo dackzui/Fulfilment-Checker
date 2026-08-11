@@ -656,6 +656,8 @@ def build(
             )
         if item.get("pallet_qty"):
             return ft.Text(f"{item['qty']} (Pallet)", font_family=FONT_FAMILY, color="#2E7D32")
+        if item.get("set_qty"):
+            return ft.Text(f"{item['qty']} (Set)", font_family=FONT_FAMILY, color="#6A1B9A")
         return ft.Text(str(item["qty"]), font_family=FONT_FAMILY)
 
     def refresh_table():
@@ -772,15 +774,39 @@ def build(
                 show_snack(f"Scanned {part_no} — {manual_qty} box(es) × {per_box} = {qty}")
             else:
                 show_snack(f"Scanned {part_no} — Box Qty: {qty}")
+        elif qty_source == "set":
+            per_set = qty // manual_qty if manual_qty else qty
+            if manual_qty > 1:
+                show_snack(f"Scanned {part_no} — {manual_qty} set(s) × {per_set} = {qty}")
+            else:
+                show_snack(f"Scanned {part_no} — Set Qty: {qty}")
+        elif qty_source == "pallet":
+            per_pallet = qty // manual_qty if manual_qty else qty
+            if manual_qty > 1:
+                show_snack(
+                    f"Scanned {part_no} — {manual_qty} pallet(s) × {per_pallet} = {qty}"
+                )
+            else:
+                show_snack(f"Scanned {part_no} — Pallet Qty: {qty}")
         elif manual_qty > 1:
             show_snack(f"Scanned {part_no} — {manual_qty} item(s)")
         elif match_status == "on_ticket":
             show_snack(f"Scanned {part_no} — qty {qty}")
 
         lookup = barcode_catalog.lookup_barcode(code)
+        set_unit = (
+            int(lookup["set_qty"])
+            if qty_source == "set" and lookup and lookup.get("set_qty")
+            else None
+        )
         box_unit = (
             int(lookup["box_qty"])
             if qty_source == "box" and lookup and lookup.get("box_qty")
+            else None
+        )
+        pallet_unit = (
+            int(lookup["pallet_qty"])
+            if qty_source == "pallet" and lookup and lookup.get("pallet_qty")
             else None
         )
         scanned_items.append(
@@ -789,9 +815,12 @@ def build(
                 "part_no": part_no,
                 "description": description,
                 "qty": qty,
+                "set_qty": set_unit,
                 "box_qty": box_unit,
-                "pack_count": manual_qty if qty_source == "box" else None,
-                "pallet_qty": None,
+                "pack_count": manual_qty
+                if qty_source in {"box", "set", "pallet"}
+                else None,
+                "pallet_qty": pallet_unit,
                 "match_status": match_status,
                 "qty_ok": result["qty_ok"],
             }
@@ -886,6 +915,7 @@ def build(
                 "part_no": part_no,
                 "description": description,
                 "qty": qty,
+                "set_qty": None,
                 "box_qty": None,
                 "pallet_qty": None,
                 "manual": True,
@@ -1403,6 +1433,7 @@ def build(
                     "part_no": row.get("part_no", ""),
                     "description": row.get("description", ""),
                     "qty": int(row.get("qty", 1)),
+                    "set_qty": row.get("set_qty"),
                     "box_qty": row.get("box_qty"),
                     "pallet_qty": row.get("pallet_qty"),
                     "manual": bool(row.get("manual"))

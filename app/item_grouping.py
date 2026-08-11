@@ -7,10 +7,20 @@ from typing import Any
 from app.pdf_parser import normalize_part
 
 
-def box_pack_label(item: dict[str, Any]) -> str | None:
-    """Return box count label e.g. ``2 Boxes``."""
+def _pack_unit_from_lookup(barcode: str, qty_type: str) -> int | None:
     from app import barcode_catalog
 
+    lookup = barcode_catalog.lookup_barcode(barcode)
+    if not lookup:
+        return None
+    key = {"set": "set_qty", "box": "box_qty", "pallet": "pallet_qty"}.get(qty_type)
+    if not key or not lookup.get(key):
+        return None
+    return int(lookup[key])
+
+
+def pack_label(item: dict[str, Any]) -> str | None:
+    """Return pack count label e.g. ``2 Boxes`` / ``3 Sets``."""
     if item.get("manual"):
         return None
 
@@ -18,30 +28,43 @@ def box_pack_label(item: dict[str, Any]) -> str | None:
     if not barcode:
         return None
 
+    qty_type = _scan_qty_type(item)
+    if qty_type == "unit":
+        return None
+
+    noun = {"box": "Box", "set": "Set", "pallet": "Pallet"}[qty_type]
     pack_count = item.get("pack_count")
     if pack_count:
         n = int(pack_count)
-        return f"{n} Box" if n == 1 else f"{n} Boxes"
+        return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
-    if not item.get("box_qty"):
-        return None
-
-    lookup = barcode_catalog.lookup_barcode(barcode)
-    unit = int(lookup["box_qty"]) if lookup and lookup.get("box_qty") else None
+    unit = _pack_unit_from_lookup(barcode, qty_type)
     if not unit:
         return None
 
     total = int(item.get("qty", 0))
     n = max(1, total // unit)
-    return f"{n} Box" if n == 1 else f"{n} Boxes"
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
-def box_qty_display(item: dict[str, Any]) -> str | None:
-    """Return e.g. ``Qty 40 (2 Boxes)`` for box scans."""
-    pack = box_pack_label(item)
+def box_pack_label(item: dict[str, Any]) -> str | None:
+    """Compatibility wrapper — prefer :func:`pack_label`."""
+    if _scan_qty_type(item) != "box":
+        return None
+    return pack_label(item)
+
+
+def pack_qty_display(item: dict[str, Any]) -> str | None:
+    """Return e.g. ``Qty 40 (2 Boxes)`` / ``Qty 6 (1 Set)``."""
+    pack = pack_label(item)
     if not pack:
         return None
     return f"Qty {int(item.get('qty', 0))} ({pack})"
+
+
+def box_qty_display(item: dict[str, Any]) -> str | None:
+    """Compatibility wrapper used by New Scan / history export."""
+    return pack_qty_display(item)
 
 
 def _group_key(item: dict[str, Any]) -> str:
@@ -56,6 +79,8 @@ def _scan_qty_type(item: dict[str, Any]) -> str:
         return "pallet"
     if item.get("box_qty"):
         return "box"
+    if item.get("set_qty"):
+        return "set"
     return "unit"
 
 
@@ -82,6 +107,7 @@ def consolidate_scans_by_barcode(scans: list[dict[str, Any]]) -> list[dict[str, 
                 merged[key] = {
                     "item_scanned": "Manual",
                     "qty": 0,
+                    "set_qty": None,
                     "box_qty": None,
                     "pallet_qty": None,
                     "part_no": scan.get("part_no", ""),
@@ -102,9 +128,12 @@ def consolidate_scans_by_barcode(scans: list[dict[str, Any]]) -> list[dict[str, 
             merged[key] = {
                 "item_scanned": barcode,
                 "qty": 0,
+                "set_qty": scan.get("set_qty") if qty_type == "set" else None,
                 "box_qty": scan.get("box_qty") if qty_type == "box" else None,
                 "pallet_qty": scan.get("pallet_qty") if qty_type == "pallet" else None,
-                "pack_count": int(scan.get("pack_count") or 0) if qty_type == "box" else 0,
+                "pack_count": int(scan.get("pack_count") or 0)
+                if qty_type in {"box", "set", "pallet"}
+                else 0,
                 "part_no": scan.get("part_no", ""),
                 "description": scan.get("description", ""),
             }
@@ -112,17 +141,14 @@ def consolidate_scans_by_barcode(scans: list[dict[str, Any]]) -> list[dict[str, 
 
         entry = merged[key]
         entry["qty"] += int(scan.get("qty", 1))
-        if qty_type == "box":
+        if qty_type in {"box", "set", "pallet"}:
             added = int(scan.get("pack_count") or 0)
             if not added:
-                from app import barcode_catalog
-
-                lookup = barcode_catalog.lookup_barcode(barcode)
-                unit = int(lookup["box_qty"]) if lookup and lookup.get("box_qty") else None
+                unit = _pack_unit_from_lookup(barcode, qty_type)
                 if unit:
                     added = max(1, int(scan.get("qty", 1)) // unit)
             entry["pack_count"] = int(entry.get("pack_count") or 0) + added
-        if entry.get("pallet_qty") is not None:
+        if entry.get("pallet_qty") is not None and qty_type == "pallet":
             entry["pallet_qty"] = entry["qty"]
 
     return [merged[key] for key in order]
@@ -134,12 +160,10 @@ def format_scan_label(item: dict[str, Any]) -> str:
         qty = int(item.get("qty", 1))
         return f"Manual — Qty: {qty}"
     barcode = (item.get("item_scanned") or "").strip()
-    box_display = box_qty_display(item)
-    if box_display:
-        return f"{barcode} — {box_display}"
+    pack_display = pack_qty_display(item)
+    if pack_display:
+        return f"{barcode} — {pack_display}"
     qty = int(item.get("qty", 1))
-    if item.get("pallet_qty"):
-        return f"{barcode} — Pallet: {qty}"
     if qty > 1:
         return f"{barcode} — Qty: {qty}"
     return barcode

@@ -33,10 +33,11 @@ def _master_path() -> Path:
 BARCODE_HEADERS = {"barcode"}
 PART_HEADERS = {"item part nubmer", "item part number", "part no", "part_no", "deks part #"}
 DESC_HEADERS = {"description"}
+SET_QTY_HEADERS = {"setqty", "set qty", "set_qty"}
 BOX_QTY_HEADERS = {"boxqty", "box qty", "box_qty", "carton/qty", "single /qty", "single/qty"}
 PALLET_QTY_HEADERS = {"palletqty", "pallet qty", "pallet_qty"}
 
-CATALOG_SCHEMA_VERSION = "2"
+CATALOG_SCHEMA_VERSION = "3"
 
 
 def _load_config() -> dict[str, Any]:
@@ -105,6 +106,7 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
             barcode TEXT PRIMARY KEY,
             part_no TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
+            set_qty INTEGER,
             box_qty INTEGER,
             pallet_qty INTEGER
         );
@@ -119,6 +121,9 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
     columns = {
         row[1] for row in conn.execute("PRAGMA table_info(barcode_master)").fetchall()
     }
+    if "set_qty" not in columns:
+        conn.execute("ALTER TABLE barcode_master ADD COLUMN set_qty INTEGER")
+        conn.execute("DELETE FROM app_metadata WHERE key = 'barcode_master_count'")
     if "box_qty" not in columns:
         conn.execute("ALTER TABLE barcode_master ADD COLUMN box_qty INTEGER")
         conn.execute("DELETE FROM app_metadata WHERE key = 'barcode_master_count'")
@@ -139,6 +144,8 @@ def _column_map(headers: list[Any]) -> dict[str, int]:
             mapping["part_no"] = index
         elif name in DESC_HEADERS:
             mapping["description"] = index
+        elif name in SET_QTY_HEADERS or (name.startswith("set") and "qty" in name):
+            mapping["set_qty"] = index
         elif name in BOX_QTY_HEADERS or ("box" in name and "qty" in name and "pallet" not in name):
             mapping["box_qty"] = index
         elif name in PALLET_QTY_HEADERS or ("pallet" in name and "qty" in name):
@@ -176,24 +183,35 @@ def scan_qty_for_barcode(
     barcode: str,
     manual_qty: int = 1,
 ) -> tuple[int, str | None]:
-    """Return qty to apply for a scan and whether it came from BoxQty.
+    """Return qty to apply for a scan and which pack column it came from.
 
-    Box barcodes apply BoxQty × ``manual_qty``. All other barcodes count as
-    ``manual_qty`` singles (e.g. single-item barcodes with no BoxQty).
-
-    PalletQty in the master list is stored for reference only — pallets are
-    not scanned via barcode.
+    Uses the first set value on the barcode row:
+      1. SetQty   → set pack
+      2. BoxQty   → box pack
+      3. PalletQty → pallet pack (when filled later)
+      4. otherwise → ``manual_qty`` singles (each / default 1)
 
     Returns:
-        (qty, qty_source) where qty_source is ``"box"`` or ``None``.
+        (qty, qty_source) where qty_source is ``"set"``, ``"box"``, ``"pallet"``,
+        or ``None`` for each/single.
     """
     lookup = lookup_barcode(barcode)
     count = max(1, manual_qty)
     if not lookup:
         return count, None
+
+    set_qty = lookup.get("set_qty")
+    if set_qty is not None and int(set_qty) > 0:
+        return int(set_qty) * count, "set"
+
     box_qty = lookup.get("box_qty")
     if box_qty is not None and int(box_qty) > 0:
         return int(box_qty) * count, "box"
+
+    pallet_qty = lookup.get("pallet_qty")
+    if pallet_qty is not None and int(pallet_qty) > 0:
+        return int(pallet_qty) * count, "pallet"
+
     return count, None
 
 
@@ -237,9 +255,10 @@ def load_from_excel(path: Path | None = None) -> int:
         raise ValueError("Barcode master list must include Barcode and Item Part Number columns.")
 
     desc_index = columns.get("description")
+    set_qty_index = columns.get("set_qty")
     box_qty_index = columns.get("box_qty")
     pallet_qty_index = columns.get("pallet_qty")
-    records: list[tuple[str, str, str, int | None, int | None]] = []
+    records: list[tuple[str, str, str, int | None, int | None, int | None]] = []
     seen: set[str] = set()
     seen_parts: set[str] = set()
 
@@ -265,6 +284,13 @@ def load_from_excel(path: Path | None = None) -> int:
         seen_parts.add(part_key)
 
         description = _cell_text(row[desc_index]) if desc_index is not None else ""
+        set_qty = (
+            _cell_int(row[set_qty_index])
+            if set_qty_index is not None and set_qty_index < len(row)
+            else None
+        )
+        if set_qty is not None and set_qty < 1:
+            set_qty = None
         box_qty = (
             _cell_int(row[box_qty_index])
             if box_qty_index is not None and box_qty_index < len(row)
@@ -279,7 +305,7 @@ def load_from_excel(path: Path | None = None) -> int:
         )
         if pallet_qty is not None and pallet_qty < 1:
             pallet_qty = None
-        records.append((barcode, part_no, description, box_qty, pallet_qty))
+        records.append((barcode, part_no, description, set_qty, box_qty, pallet_qty))
 
     workbook.close()
 
@@ -287,7 +313,7 @@ def load_from_excel(path: Path | None = None) -> int:
         _ensure_tables(conn)
         conn.execute("DELETE FROM barcode_master")
         conn.executemany(
-            "INSERT INTO barcode_master (barcode, part_no, description, box_qty, pallet_qty) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO barcode_master (barcode, part_no, description, set_qty, box_qty, pallet_qty) VALUES (?, ?, ?, ?, ?, ?)",
             records,
         )
         conn.execute(
@@ -349,6 +375,9 @@ def ensure_loaded() -> int:
     file_mtime = str(path.stat().st_mtime)
     with _connect() as conn:
         _ensure_tables(conn)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(barcode_master)").fetchall()
+        }
         count_row = conn.execute(
             "SELECT value FROM app_metadata WHERE key = 'barcode_master_count'"
         ).fetchone()
@@ -358,8 +387,11 @@ def ensure_loaded() -> int:
         schema_row = conn.execute(
             "SELECT value FROM app_metadata WHERE key = 'catalog_schema_version'"
         ).fetchone()
+        # Old installs may lack set_qty until reload — never trust a stale cache.
+        has_set_column = "set_qty" in columns
         if (
-            count_row
+            has_set_column
+            and count_row
             and int(count_row["value"]) > 0
             and mtime_row
             and mtime_row["value"] == file_mtime
@@ -533,7 +565,7 @@ def lookup_barcode(barcode: str) -> dict[str, str] | None:
     with _connect() as conn:
         _ensure_tables(conn)
         row = conn.execute(
-            "SELECT barcode, part_no, description, box_qty, pallet_qty FROM barcode_master WHERE barcode = ?",
+            "SELECT barcode, part_no, description, set_qty, box_qty, pallet_qty FROM barcode_master WHERE barcode = ?",
             (code,),
         ).fetchone()
         if row:
@@ -541,6 +573,8 @@ def lookup_barcode(barcode: str) -> dict[str, str] | None:
                 "part_no": row["part_no"],
                 "description": row["description"] or "",
             }
+            if row["set_qty"]:
+                result["set_qty"] = int(row["set_qty"])
             if row["box_qty"]:
                 result["box_qty"] = int(row["box_qty"])
             if row["pallet_qty"]:
