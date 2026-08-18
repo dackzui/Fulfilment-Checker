@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import date, datetime, time as dt_time
 from pathlib import Path
+from typing import Any
 
 import flet as ft
 
@@ -14,12 +16,54 @@ from app import database
 from app import firebase_presence
 from app import scheduled_sync
 from app.components import muted
-from app.paths import init_app_storage, logo_src
+from app.paths import get_data_dir, init_app_storage, logo_src
 from app.theme import BG_MAIN, FONT_FAMILY, PRIMARY, TEXT
 
 _REFRESH_SECONDS = 15
+_REFRESH_OPTIONS = (10, 15, 30, 60)
 _BAR_COLORS = ("#1E88E5", "#43A047", "#FB8C00", "#8E24AA", "#00897B", "#C62828")
 _CROWN = "👑"
+
+
+def _monitor_config_path() -> Path:
+    return get_data_dir() / "config.json"
+
+
+def _load_refresh_prefs() -> dict[str, Any]:
+    path = _monitor_config_path()
+    data: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    enabled = data.get("monitor_auto_refresh")
+    if enabled is None:
+        enabled = True
+    seconds = int(data.get("monitor_refresh_seconds") or _REFRESH_SECONDS)
+    if seconds not in _REFRESH_OPTIONS:
+        seconds = _REFRESH_SECONDS
+    return {"enabled": bool(enabled), "seconds": seconds}
+
+
+def _save_refresh_prefs(*, enabled: bool, seconds: int) -> None:
+    path = _monitor_config_path()
+    data: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    data["monitor_auto_refresh"] = bool(enabled)
+    data["monitor_refresh_seconds"] = (
+        seconds if seconds in _REFRESH_OPTIONS else _REFRESH_SECONDS
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def _format_iso_range(start_iso: str, end_iso: str) -> str:
@@ -346,8 +390,30 @@ async def main(page: ft.Page):
         fleet_backup_list = ft.Column(spacing=6, tight=True)
 
         filter_state = {"value": "this", "prize": ""}
+        refresh_prefs = _load_refresh_prefs()
+        refresh_state = {
+            "enabled": bool(refresh_prefs["enabled"]),
+            "seconds": int(refresh_prefs["seconds"]),
+            "last_at": None,
+        }
         refresh_token = time.time()
         page._monitor_token = refresh_token
+
+        auto_refresh_switch = ft.Switch(
+            label="Auto refresh",
+            value=bool(refresh_state["enabled"]),
+        )
+        refresh_interval_dropdown = ft.Dropdown(
+            label="Every",
+            width=120,
+            dense=True,
+            value=str(refresh_state["seconds"]),
+            options=[
+                ft.DropdownOption(key=str(sec), text=f"{sec}s")
+                for sec in _REFRESH_OPTIONS
+            ],
+        )
+        last_refresh_label = muted("Last updated: —")
 
         def render_prize_banner(message: str, top_name: str | None) -> None:
             text = (message or "").strip()
@@ -458,6 +524,18 @@ async def main(page: ft.Page):
 
             render_online_pickers(list(snap.get("presence") or []))
 
+            now = datetime.now().strftime("%H:%M:%S")
+            refresh_state["last_at"] = now
+            interval = int(refresh_state["seconds"])
+            if refresh_state["enabled"]:
+                last_refresh_label.value = (
+                    f"Last updated: {now} · auto every {interval}s"
+                )
+            else:
+                last_refresh_label.value = (
+                    f"Last updated: {now} · auto refresh off"
+                )
+
             if snap.get("configured"):
                 access = (
                     "full access"
@@ -504,6 +582,53 @@ async def main(page: ft.Page):
                         pass
 
             page.run_thread(work)
+
+        def persist_refresh_prefs() -> None:
+            try:
+                _save_refresh_prefs(
+                    enabled=bool(refresh_state["enabled"]),
+                    seconds=int(refresh_state["seconds"]),
+                )
+            except Exception:
+                pass
+
+        def on_auto_refresh_toggle(e):
+            refresh_state["enabled"] = bool(e.control.value)
+            persist_refresh_prefs()
+            interval = int(refresh_state["seconds"])
+            stamp = refresh_state.get("last_at") or "—"
+            if refresh_state["enabled"]:
+                last_refresh_label.value = (
+                    f"Last updated: {stamp} · auto every {interval}s"
+                )
+                show_snack(f"Auto refresh on — every {interval}s.")
+            else:
+                last_refresh_label.value = (
+                    f"Last updated: {stamp} · auto refresh off"
+                )
+                show_snack("Auto refresh off — use Refresh for latest data.")
+            page.update()
+
+        def on_refresh_interval_change(e):
+            try:
+                seconds = int((e.control.value or str(_REFRESH_SECONDS)).strip())
+            except ValueError:
+                seconds = _REFRESH_SECONDS
+            if seconds not in _REFRESH_OPTIONS:
+                seconds = _REFRESH_SECONDS
+            refresh_state["seconds"] = seconds
+            refresh_interval_dropdown.value = str(seconds)
+            persist_refresh_prefs()
+            stamp = refresh_state.get("last_at") or "—"
+            if refresh_state["enabled"]:
+                last_refresh_label.value = (
+                    f"Last updated: {stamp} · auto every {seconds}s"
+                )
+            show_snack(f"Auto refresh interval set to {seconds}s.")
+            page.update()
+
+        auto_refresh_switch.on_change = on_auto_refresh_toggle
+        refresh_interval_dropdown.on_change = on_refresh_interval_change
 
         def save_week_filter(chosen: str):
             if not can_edit:
@@ -1789,24 +1914,25 @@ async def main(page: ft.Page):
         def auto_loop():
             while getattr(page, "_monitor_token", None) == refresh_token:
                 try:
-                    if firebase_presence.is_configured():
-                        try:
-                            firebase_presence.publish_heartbeat(
-                                username=admin_name,
-                                role=admin_role,
-                                online=True,
-                            )
-                        except Exception:
-                            pass
-                    snap = firebase_presence.dashboard_snapshot()
+                    if refresh_state["enabled"]:
+                        if firebase_presence.is_configured():
+                            try:
+                                firebase_presence.publish_heartbeat(
+                                    username=admin_name,
+                                    role=admin_role,
+                                    online=True,
+                                )
+                            except Exception:
+                                pass
+                        snap = firebase_presence.dashboard_snapshot()
 
-                    def apply():
-                        if getattr(page, "_monitor_token", None) != refresh_token:
-                            return
-                        apply_snapshot(snap)
-                        page.update()
+                        def apply():
+                            if getattr(page, "_monitor_token", None) != refresh_token:
+                                return
+                            apply_snapshot(snap)
+                            page.update()
 
-                    apply()
+                        apply()
                 except Exception as exc:
 
                     def show_err(message=str(exc)):
@@ -1816,7 +1942,8 @@ async def main(page: ft.Page):
                         page.update()
 
                     show_err()
-                for _ in range(_REFRESH_SECONDS):
+                wait_for = max(5, int(refresh_state.get("seconds") or _REFRESH_SECONDS))
+                for _ in range(wait_for):
                     if getattr(page, "_monitor_token", None) != refresh_token:
                         return
                     time.sleep(1)
@@ -1824,6 +1951,8 @@ async def main(page: ft.Page):
         page.run_thread(auto_loop)
 
         header_actions = [
+            auto_refresh_switch,
+            refresh_interval_dropdown,
             ft.OutlinedButton(
                 "Refresh",
                 icon=ft.Icons.REFRESH,
@@ -1849,13 +1978,15 @@ async def main(page: ft.Page):
                             [
                                 title,
                                 muted(
-                                    "Live ranking for monitoring — refreshes automatically."
+                                    "Live ranking for monitoring — leaderboard and online "
+                                    "pickers refresh automatically."
                                     + (
                                         ""
                                         if can_edit
                                         else " View-only access."
                                     )
                                 ),
+                                last_refresh_label,
                             ],
                             spacing=4,
                             expand=True,
