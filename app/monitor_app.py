@@ -78,13 +78,19 @@ def _format_iso_range(start_iso: str, end_iso: str) -> str:
 def _ranked_pickers(
     rows: list[firebase_presence.UserFulfilmentRow],
     which: str,
-) -> list[tuple[str, int]]:
-    ranked: list[tuple[str, int]] = []
+) -> list[tuple[str, int, int]]:
+    """Return (picker_name, picks, lines) ranked by picks then lines."""
+    ranked: list[tuple[str, int, int]] = []
     for row in rows:
-        count = row.last_week if which == "last" else row.week
-        if count > 0:
-            ranked.append((row.picker_name, int(count)))
-    ranked.sort(key=lambda item: (-item[1], item[0].lower()))
+        if which == "last":
+            picks = int(row.last_week)
+            lines = int(row.last_week_lines)
+        else:
+            picks = int(row.week)
+            lines = int(row.week_lines)
+        if picks > 0 or lines > 0:
+            ranked.append((row.picker_name, picks, lines))
+    ranked.sort(key=lambda item: (-item[1], -item[2], item[0].lower()))
     return ranked
 
 
@@ -105,13 +111,25 @@ def _online_pickers(
                 continue
             row = by_name.setdefault(
                 name,
-                {"picker_name": name, "today": 0, "devices": []},
+                {"picker_name": name, "today": 0, "today_lines": 0, "devices": []},
             )
             row["today"] = int(row["today"]) + qty
             devices = row["devices"]
             assert isinstance(devices, list)
             if entry.device_label and entry.device_label not in devices:
                 devices.append(entry.device_label)
+        for name, count in (entry.stats_today_lines or {}).items():
+            try:
+                qty = int(count)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            row = by_name.setdefault(
+                name,
+                {"picker_name": name, "today": 0, "today_lines": 0, "devices": []},
+            )
+            row["today_lines"] = int(row["today_lines"]) + qty
     rows = list(by_name.values())
     rows.sort(
         key=lambda item: (-int(item["today"]), str(item["picker_name"]).lower())
@@ -119,15 +137,21 @@ def _online_pickers(
     return rows
 
 
-def _monitor_bar_chart(rows: list[tuple[str, int]]) -> ft.Control:
+def _format_picks_lines(picks: int, lines: int) -> str:
+    pick_bit = f"{picks} pick" if picks == 1 else f"{picks} picks"
+    line_bit = f"{lines} line" if lines == 1 else f"{lines} lines"
+    return f"{pick_bit} · {line_bit}"
+
+
+def _monitor_bar_chart(rows: list[tuple[str, int, int]]) -> ft.Control:
     if not rows:
         return muted("No pickups recorded for this period yet.")
 
-    max_count = max(count for _, count in rows) or 1
+    max_count = max(picks for _, picks, _ in rows) or 1
     bars: list[ft.Control] = []
-    for index, (name, count) in enumerate(rows):
+    for index, (name, picks, lines) in enumerate(rows):
         is_top = index == 0
-        width_frac = max(0.08, count / max_count)
+        width_frac = max(0.08, picks / max_count)
         color = "#F9A825" if is_top else _BAR_COLORS[index % len(_BAR_COLORS)]
         name_row: list[ft.Control] = []
         if is_top:
@@ -144,8 +168,8 @@ def _monitor_bar_chart(rows: list[tuple[str, int]]) -> ft.Control:
         )
         name_row.append(
             ft.Text(
-                str(count),
-                size=18 if is_top else 15,
+                _format_picks_lines(picks, lines),
+                size=16 if is_top else 14,
                 weight=ft.FontWeight.BOLD,
                 color="#F57F17" if is_top else PRIMARY,
                 font_family=FONT_FAMILY,
@@ -480,7 +504,10 @@ async def main(page: ft.Page):
                                             weight=ft.FontWeight.W_600,
                                             font_family=FONT_FAMILY,
                                         ),
-                                        muted(f"Today: {row['today']} pickup(s){device_bit}"),
+                                        muted(
+                                            f"Today: {_format_picks_lines(int(row['today']), int(row.get('today_lines') or 0))}"
+                                            f"{device_bit}"
+                                        ),
                                     ],
                                     spacing=2,
                                     tight=True,
@@ -515,8 +542,11 @@ async def main(page: ft.Page):
             ranked = _ranked_pickers(list(snap.get("fulfilments") or []), which)
             chart_host.controls = [_monitor_bar_chart(ranked[:12])]
             if ranked:
-                top_name, top_count = ranked[0]
-                top_label.value = f"{_CROWN}  #1 {top_name}  —  {top_count} pickups"
+                top_name, top_picks, top_lines = ranked[0]
+                top_label.value = (
+                    f"{_CROWN}  #1 {top_name}  —  "
+                    f"{_format_picks_lines(top_picks, top_lines)}"
+                )
                 render_prize_banner(prize, top_name)
             else:
                 top_label.value = "No pickups yet for this period"
@@ -1815,6 +1845,9 @@ async def main(page: ft.Page):
                         size=18,
                         weight=ft.FontWeight.W_600,
                         font_family=FONT_FAMILY,
+                    ),
+                    muted(
+                        "Completed picks and ticket lines per picker for the selected week."
                     ),
                     ft.Container(content=chart_host, expand=True),
                 ],

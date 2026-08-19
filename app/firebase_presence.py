@@ -54,6 +54,10 @@ class PresenceEntry:
     stats_total: dict[str, int] | None = None
     stats_week: dict[str, int] | None = None
     stats_last_week: dict[str, int] | None = None
+    stats_today_lines: dict[str, int] | None = None
+    stats_total_lines: dict[str, int] | None = None
+    stats_week_lines: dict[str, int] | None = None
+    stats_last_week_lines: dict[str, int] | None = None
 
 
 @dataclass
@@ -65,6 +69,10 @@ class UserFulfilmentRow:
     total: int
     week: int = 0
     last_week: int = 0
+    today_lines: int = 0
+    total_lines: int = 0
+    week_lines: int = 0
+    last_week_lines: int = 0
     online: bool = False
     devices: list[str] | None = None
 
@@ -612,6 +620,10 @@ def fetch_presence() -> list[PresenceEntry]:
         total_map = _as_int_map(local_stats.get("total"))
         week_map = _as_int_map(local_stats.get("week"))
         last_week_map = _as_int_map(local_stats.get("last_week"))
+        today_lines_map = _as_int_map(local_stats.get("today_lines"))
+        total_lines_map = _as_int_map(local_stats.get("total_lines"))
+        week_lines_map = _as_int_map(local_stats.get("week_lines"))
+        last_week_lines_map = _as_int_map(local_stats.get("last_week_lines"))
         try:
             today_sum = int(local_stats.get("today_sum") or sum(today_map.values()))
         except (TypeError, ValueError):
@@ -642,6 +654,10 @@ def fetch_presence() -> list[PresenceEntry]:
                 stats_total=total_map,
                 stats_week=week_map,
                 stats_last_week=last_week_map,
+                stats_today_lines=today_lines_map,
+                stats_total_lines=total_lines_map,
+                stats_week_lines=week_lines_map,
+                stats_last_week_lines=last_week_lines_map,
             )
         )
 
@@ -661,16 +677,24 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
     total: dict[str, int] = {}
     week: dict[str, int] = {}
     last_week: dict[str, int] = {}
+    today_lines: dict[str, int] = {}
+    total_lines: dict[str, int] = {}
+    week_lines: dict[str, int] = {}
+    last_week_lines: dict[str, int] = {}
+
+    def _add(target: dict[str, int], source: dict[str, int] | None) -> None:
+        for name, count in (source or {}).items():
+            target[name] = target.get(name, 0) + int(count)
 
     for entry in entries:
-        for name, count in (entry.stats_today or {}).items():
-            today[name] = today.get(name, 0) + int(count)
-        for name, count in (entry.stats_total or {}).items():
-            total[name] = total.get(name, 0) + int(count)
-        for name, count in (entry.stats_week or {}).items():
-            week[name] = week.get(name, 0) + int(count)
-        for name, count in (entry.stats_last_week or {}).items():
-            last_week[name] = last_week.get(name, 0) + int(count)
+        _add(today, entry.stats_today)
+        _add(total, entry.stats_total)
+        _add(week, entry.stats_week)
+        _add(last_week, entry.stats_last_week)
+        _add(today_lines, entry.stats_today_lines)
+        _add(total_lines, entry.stats_total_lines)
+        _add(week_lines, entry.stats_week_lines)
+        _add(last_week_lines, entry.stats_last_week_lines)
 
     # Mark a picker "online" if any online tablet recently reported that picker
     # in today's stats (they are actively being fulfilled on an open device).
@@ -683,7 +707,14 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
                 online_pickers.add(name.casefold())
 
     names = sorted(
-        set(today) | set(total) | set(week) | set(last_week),
+        set(today)
+        | set(total)
+        | set(week)
+        | set(last_week)
+        | set(today_lines)
+        | set(total_lines)
+        | set(week_lines)
+        | set(last_week_lines),
         key=lambda n: (-today.get(n, 0), n.lower()),
     )
     rows: list[UserFulfilmentRow] = []
@@ -695,6 +726,10 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
                 total=int(total.get(name, 0)),
                 week=int(week.get(name, 0)),
                 last_week=int(last_week.get(name, 0)),
+                today_lines=int(today_lines.get(name, 0)),
+                total_lines=int(total_lines.get(name, 0)),
+                week_lines=int(week_lines.get(name, 0)),
+                last_week_lines=int(last_week_lines.get(name, 0)),
                 online=name.casefold() in online_pickers,
                 devices=[],
             )
@@ -821,8 +856,17 @@ def dashboard_snapshot() -> dict[str, Any]:
         total = local.get("total") or {}
         week = local.get("week") or {}
         last_week = local.get("last_week") or {}
+        today_lines = local.get("today_lines") or {}
+        total_lines = local.get("total_lines") or {}
+        week_lines = local.get("week_lines") or {}
+        last_week_lines = local.get("last_week_lines") or {}
         names = sorted(
-            set(today) | set(total) | set(week) | set(last_week),
+            set(today)
+            | set(total)
+            | set(week)
+            | set(last_week)
+            | set(today_lines)
+            | set(week_lines),
             key=lambda n: (-int(today.get(n, 0)), n.lower()),
         )
         rows = [
@@ -832,6 +876,10 @@ def dashboard_snapshot() -> dict[str, Any]:
                 total=int(total.get(name, 0)),
                 week=int(week.get(name, 0)),
                 last_week=int(last_week.get(name, 0)),
+                today_lines=int(today_lines.get(name, 0)),
+                total_lines=int(total_lines.get(name, 0)),
+                week_lines=int(week_lines.get(name, 0)),
+                last_week_lines=int(last_week_lines.get(name, 0)),
                 online=False,
                 devices=[],
             )

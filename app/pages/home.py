@@ -26,16 +26,22 @@ def _format_iso_range(start_iso: str, end_iso: str) -> str:
         return ""
 
 
-def _week_bar_chart(rows: list[tuple[str, int]]) -> ft.Control:
-    """Horizontal bar chart — who has the most pickups in the selected week."""
+def _format_picks_lines(picks: int, lines: int) -> str:
+    pick_bit = f"{picks} pick" if picks == 1 else f"{picks} picks"
+    line_bit = f"{lines} line" if lines == 1 else f"{lines} lines"
+    return f"{pick_bit} · {line_bit}"
+
+
+def _week_bar_chart(rows: list[tuple[str, int, int]]) -> ft.Control:
+    """Horizontal bar chart — pickups and lines for the selected week."""
     if not rows:
         return muted("No weekly fulfilments yet for this period.")
 
-    max_count = max(count for _, count in rows) or 1
+    max_count = max(picks for _, picks, _ in rows) or 1
     bars: list[ft.Control] = []
-    for index, (name, count) in enumerate(rows):
+    for index, (name, picks, lines) in enumerate(rows):
         is_top = index == 0
-        width_frac = max(0.06, count / max_count)
+        width_frac = max(0.06, picks / max_count)
         color = "#F9A825" if is_top else _BAR_COLORS[index % len(_BAR_COLORS)]
         label_controls: list[ft.Control] = []
         if is_top:
@@ -52,8 +58,8 @@ def _week_bar_chart(rows: list[tuple[str, int]]) -> ft.Control:
         )
         label_controls.append(
             ft.Text(
-                str(count),
-                size=13,
+                _format_picks_lines(picks, lines),
+                size=12,
                 weight=ft.FontWeight.W_600,
                 font_family=FONT_FAMILY,
                 color=PRIMARY if is_top else TEXT,
@@ -296,13 +302,30 @@ def build(
                                         font_family=FONT_FAMILY,
                                         text_align=ft.TextAlign.RIGHT,
                                     ),
-                                    muted("today"),
+                                    muted("picks today"),
                                 ],
                                 spacing=0,
                                 tight=True,
                                 horizontal_alignment=ft.CrossAxisAlignment.END,
                             ),
-                            ft.Container(width=16),
+                            ft.Container(width=12),
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        str(row.today_lines),
+                                        size=22,
+                                        weight=ft.FontWeight.BOLD,
+                                        color=PRIMARY,
+                                        font_family=FONT_FAMILY,
+                                        text_align=ft.TextAlign.RIGHT,
+                                    ),
+                                    muted("lines today"),
+                                ],
+                                spacing=0,
+                                tight=True,
+                                horizontal_alignment=ft.CrossAxisAlignment.END,
+                            ),
+                            ft.Container(width=12),
                             ft.Column(
                                 [
                                     ft.Text(
@@ -313,7 +336,7 @@ def build(
                                         font_family=FONT_FAMILY,
                                         text_align=ft.TextAlign.RIGHT,
                                     ),
-                                    muted("total"),
+                                    muted("picks total"),
                                 ],
                                 spacing=0,
                                 tight=True,
@@ -333,12 +356,17 @@ def build(
         prize_message: str = "",
     ) -> None:
         week_chart_host.controls.clear()
-        ranked: list[tuple[str, int]] = []
+        ranked: list[tuple[str, int, int]] = []
         for row in rows:
-            count = row.last_week if which == "last" else row.week
-            if count > 0:
-                ranked.append((row.picker_name, int(count)))
-        ranked.sort(key=lambda item: (-item[1], item[0].lower()))
+            if which == "last":
+                picks = int(row.last_week)
+                lines = int(row.last_week_lines)
+            else:
+                picks = int(row.week)
+                lines = int(row.week_lines)
+            if picks > 0 or lines > 0:
+                ranked.append((row.picker_name, picks, lines))
+        ranked.sort(key=lambda item: (-item[1], -item[2], item[0].lower()))
         top_name = ranked[0][0] if ranked else None
         prize = (prize_message or "").strip()
         if prize:
@@ -372,9 +400,12 @@ def build(
                 )
             )
         if ranked:
-            top_name, top_count = ranked[0]
+            top_name, top_picks, top_lines = ranked[0]
             week_chart_host.controls.append(
-                muted(f"👑 Most this period: {top_name} ({top_count})")
+                muted(
+                    f"👑 Most this period: {top_name} "
+                    f"({_format_picks_lines(top_picks, top_lines)})"
+                )
             )
         week_chart_host.controls.append(_week_bar_chart(ranked[:12]))
 
@@ -612,7 +643,7 @@ def build(
                     font_family=FONT_FAMILY,
                 ),
                 muted(
-                    "Bar graph of completed fulfilments by picker (Mon–Sun). "
+                    "Bar graph of completed picks and ticket lines by picker (Mon–Sun). "
                     "Only Super Admin can change the week filter."
                 ),
                 week_filter_row,

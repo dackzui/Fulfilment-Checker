@@ -385,37 +385,8 @@ def fulfilment_counts_by_picker(*, today_only: bool = False) -> dict[str, int]:
 
     ``today_only`` matches ``check_date`` in DD/MM/YYYY (local app date format).
     """
-    today = date.today().strftime("%d/%m/%Y")
-    with _connect() as conn:
-        _migrate(conn)
-        if today_only:
-            rows = conn.execute(
-                """
-                SELECT picker_name, COUNT(*) AS count
-                FROM scan_sessions
-                WHERE COALESCE(status, 'completed') = 'completed'
-                  AND check_date = ?
-                GROUP BY picker_name
-                """,
-                (today,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT picker_name, COUNT(*) AS count
-                FROM scan_sessions
-                WHERE COALESCE(status, 'completed') = 'completed'
-                GROUP BY picker_name
-                """
-            ).fetchall()
-
-    counts: dict[str, int] = {}
-    for row in rows:
-        name = capitalize_person_name(str(row["picker_name"] or "")).strip()
-        if not name:
-            name = "Unknown"
-        counts[name] = counts.get(name, 0) + int(row["count"])
-    return counts
+    picks, _lines = fulfilment_stats_by_picker(today_only=today_only)
+    return picks
 
 
 def week_date_bounds(which: str = "this") -> tuple[date, date]:
@@ -429,47 +400,130 @@ def week_date_bounds(which: str = "this") -> tuple[date, date]:
     return start, end
 
 
-def fulfilment_counts_by_picker_range(start: date, end: date) -> dict[str, int]:
-    """Completed fulfilments whose check_date falls in ``start``..``end`` inclusive."""
+def _session_line_count(ticket_json: str | None, item_rows: list[Any]) -> int:
+    """Lines/rows for one completed pick — ticket lines, else distinct scanned parts."""
+    if ticket_json:
+        try:
+            data = json.loads(ticket_json)
+            items = data.get("items") if isinstance(data, dict) else None
+            if isinstance(items, list) and items:
+                return len(items)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    parts: set[str] = set()
+    for item in item_rows:
+        if isinstance(item, sqlite3.Row):
+            part = str(item["part_no"] or item["item_scanned"] or "").strip()
+        elif isinstance(item, dict):
+            part = str(item.get("part_no") or item.get("item_scanned") or "").strip()
+        else:
+            part = ""
+        if part:
+            parts.add(part.upper())
+    return len(parts)
+
+
+def fulfilment_stats_by_picker(
+    *, today_only: bool = False
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Return (picks_by_picker, lines_by_picker) for completed sessions."""
+    today = date.today().strftime("%d/%m/%Y")
     with _connect() as conn:
         _migrate(conn)
-        rows = conn.execute(
+        sessions = conn.execute(
             """
-            SELECT picker_name, check_date
+            SELECT id, picker_name, check_date, ticket_json
             FROM scan_sessions
             WHERE COALESCE(status, 'completed') = 'completed'
             """
         ).fetchall()
+        items_by_session: dict[int, list[Any]] = {}
+        for item in conn.execute(
+            "SELECT session_id, part_no, item_scanned FROM scan_items"
+        ).fetchall():
+            sid = int(item["session_id"])
+            items_by_session.setdefault(sid, []).append(item)
 
-    counts: dict[str, int] = {}
-    for row in rows:
+    picks: dict[str, int] = {}
+    lines: dict[str, int] = {}
+    for row in sessions:
+        if today_only and str(row["check_date"] or "").strip() != today:
+            continue
+        name = capitalize_person_name(str(row["picker_name"] or "")).strip() or "Unknown"
+        picks[name] = picks.get(name, 0) + 1
+        lines[name] = lines.get(name, 0) + _session_line_count(
+            row["ticket_json"],
+            items_by_session.get(int(row["id"]), []),
+        )
+    return picks, lines
+
+
+def fulfilment_counts_by_picker_range(start: date, end: date) -> dict[str, int]:
+    """Completed fulfilments whose check_date falls in ``start``..``end`` inclusive."""
+    picks, _lines = fulfilment_stats_by_picker_range(start, end)
+    return picks
+
+
+def fulfilment_stats_by_picker_range(
+    start: date, end: date
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Return (picks, lines) for completed sessions in ``start``..``end`` inclusive."""
+    with _connect() as conn:
+        _migrate(conn)
+        sessions = conn.execute(
+            """
+            SELECT id, picker_name, check_date, ticket_json
+            FROM scan_sessions
+            WHERE COALESCE(status, 'completed') = 'completed'
+            """
+        ).fetchall()
+        items_by_session: dict[int, list[Any]] = {}
+        for item in conn.execute(
+            "SELECT session_id, part_no, item_scanned FROM scan_items"
+        ).fetchall():
+            sid = int(item["session_id"])
+            items_by_session.setdefault(sid, []).append(item)
+
+    picks: dict[str, int] = {}
+    lines: dict[str, int] = {}
+    for row in sessions:
         session_date = _parse_display_date(str(row["check_date"] or ""))
         if session_date is None or session_date < start or session_date > end:
             continue
-        name = capitalize_person_name(str(row["picker_name"] or "")).strip()
-        if not name:
-            name = "Unknown"
-        counts[name] = counts.get(name, 0) + 1
-    return counts
+        name = capitalize_person_name(str(row["picker_name"] or "")).strip() or "Unknown"
+        picks[name] = picks.get(name, 0) + 1
+        lines[name] = lines.get(name, 0) + _session_line_count(
+            row["ticket_json"],
+            items_by_session.get(int(row["id"]), []),
+        )
+    return picks, lines
 
 
 def local_fulfilment_snapshot() -> dict[str, Any]:
     """Compact stats payload for Firebase presence heartbeats (by picker)."""
-    today_map = fulfilment_counts_by_picker(today_only=True)
-    total_map = fulfilment_counts_by_picker(today_only=False)
+    today_map, today_lines = fulfilment_stats_by_picker(today_only=True)
+    total_map, total_lines = fulfilment_stats_by_picker(today_only=False)
     week_start, week_end = week_date_bounds("this")
     last_start, last_end = week_date_bounds("last")
-    week_map = fulfilment_counts_by_picker_range(week_start, week_end)
-    last_week_map = fulfilment_counts_by_picker_range(last_start, last_end)
+    week_map, week_lines = fulfilment_stats_by_picker_range(week_start, week_end)
+    last_week_map, last_week_lines = fulfilment_stats_by_picker_range(
+        last_start, last_end
+    )
     return {
         "today": today_map,
         "total": total_map,
         "week": week_map,
         "last_week": last_week_map,
+        "today_lines": today_lines,
+        "total_lines": total_lines,
+        "week_lines": week_lines,
+        "last_week_lines": last_week_lines,
         "today_sum": int(sum(today_map.values())),
         "total_sum": int(sum(total_map.values())),
         "week_sum": int(sum(week_map.values())),
         "last_week_sum": int(sum(last_week_map.values())),
+        "today_lines_sum": int(sum(today_lines.values())),
+        "week_lines_sum": int(sum(week_lines.values())),
         "week_start": week_start.isoformat(),
         "week_end": week_end.isoformat(),
         "last_week_start": last_start.isoformat(),
