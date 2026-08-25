@@ -266,6 +266,14 @@ def save_session(
             )
         except Exception:
             pass
+        # Push updated fulfilment totals to Firebase immediately (non-blocking)
+        # so Monitor real-time listeners refresh without waiting for heartbeat.
+        try:
+            from app import firebase_presence
+
+            firebase_presence.notify_stats_changed(username=checker_name)
+        except Exception:
+            pass
     return sid
 
 
@@ -400,6 +408,60 @@ def week_date_bounds(which: str = "this") -> tuple[date, date]:
     return start, end
 
 
+def month_date_bounds(today: date | None = None) -> tuple[date, date]:
+    """Return first–last day of the current calendar month."""
+    today = today or date.today()
+    start = today.replace(day=1)
+    if today.month == 12:
+        end = date(today.year, 12, 31)
+    else:
+        end = date(today.year, today.month + 1, 1) - timedelta(days=1)
+    return start, end
+
+
+def _coerce_bound_date(value: Any) -> date | None:
+    """Parse ISO (YYYY-MM-DD) or display (DD/MM/YYYY) date strings."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        pass
+    return _parse_display_date(raw)
+
+
+def period_date_bounds(
+    which: str = "this",
+    *,
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> tuple[date, date]:
+    """Return inclusive date bounds for a leaderboard period.
+
+    ``which``: ``today`` | ``this`` | ``last`` | ``month`` | ``custom``.
+    """
+    key = (which or "this").strip().lower()
+    today = date.today()
+    if key in {"today", "day"}:
+        return today, today
+    if key in {"month", "this_month", "this-month"}:
+        return month_date_bounds(today)
+    if key == "custom":
+        start = _coerce_bound_date(custom_from) or today
+        end = _coerce_bound_date(custom_to) or today
+        if end < start:
+            start, end = end, start
+        return start, end
+    return week_date_bounds("last" if key == "last" else "this")
+
+
 def _session_line_count(ticket_json: str | None, item_rows: list[Any]) -> int:
     """Lines/rows for one completed pick — ticket lines, else distinct scanned parts."""
     if ticket_json:
@@ -468,6 +530,24 @@ def fulfilment_stats_by_picker_range(
     start: date, end: date
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Return (picks, lines) for completed sessions in ``start``..``end`` inclusive."""
+    daily_picks, daily_lines = fulfilment_daily_stats(start, end)
+    picks: dict[str, int] = {}
+    lines: dict[str, int] = {}
+    for day_map in daily_picks.values():
+        for name, qty in day_map.items():
+            picks[name] = picks.get(name, 0) + int(qty)
+    for day_map in daily_lines.values():
+        for name, qty in day_map.items():
+            lines[name] = lines.get(name, 0) + int(qty)
+    return picks, lines
+
+
+def fulfilment_daily_stats(
+    start: date, end: date
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
+    """Return per-day (picks, lines) maps: ``{YYYY-MM-DD: {picker: count}}``."""
+    if end < start:
+        start, end = end, start
     with _connect() as conn:
         _migrate(conn)
         sessions = conn.execute(
@@ -484,50 +564,89 @@ def fulfilment_stats_by_picker_range(
             sid = int(item["session_id"])
             items_by_session.setdefault(sid, []).append(item)
 
-    picks: dict[str, int] = {}
-    lines: dict[str, int] = {}
+    daily_picks: dict[str, dict[str, int]] = {}
+    daily_lines: dict[str, dict[str, int]] = {}
     for row in sessions:
         session_date = _parse_display_date(str(row["check_date"] or ""))
         if session_date is None or session_date < start or session_date > end:
             continue
         name = capitalize_person_name(str(row["picker_name"] or "")).strip() or "Unknown"
-        picks[name] = picks.get(name, 0) + 1
-        lines[name] = lines.get(name, 0) + _session_line_count(
+        key = session_date.isoformat()
+        picks_day = daily_picks.setdefault(key, {})
+        lines_day = daily_lines.setdefault(key, {})
+        picks_day[name] = picks_day.get(name, 0) + 1
+        lines_day[name] = lines_day.get(name, 0) + _session_line_count(
             row["ticket_json"],
             items_by_session.get(int(row["id"]), []),
         )
-    return picks, lines
+    return daily_picks, daily_lines
 
 
-def local_fulfilment_snapshot() -> dict[str, Any]:
+def local_fulfilment_snapshot(
+    *,
+    custom_from: str | None = None,
+    custom_to: str | None = None,
+) -> dict[str, Any]:
     """Compact stats payload for Firebase presence heartbeats (by picker)."""
     today_map, today_lines = fulfilment_stats_by_picker(today_only=True)
     total_map, total_lines = fulfilment_stats_by_picker(today_only=False)
     week_start, week_end = week_date_bounds("this")
     last_start, last_end = week_date_bounds("last")
+    month_start, month_end = month_date_bounds()
     week_map, week_lines = fulfilment_stats_by_picker_range(week_start, week_end)
     last_week_map, last_week_lines = fulfilment_stats_by_picker_range(
         last_start, last_end
     )
+    month_map, month_lines = fulfilment_stats_by_picker_range(month_start, month_end)
+    custom_start, custom_end = period_date_bounds(
+        "custom",
+        custom_from=custom_from,
+        custom_to=custom_to,
+    )
+    # Only emit custom stats when an explicit range was provided.
+    if custom_from or custom_to:
+        custom_map, custom_lines = fulfilment_stats_by_picker_range(
+            custom_start, custom_end
+        )
+    else:
+        custom_map, custom_lines = {}, {}
+    daily_start = date.today() - timedelta(days=62)
+    daily_end = date.today()
+    daily_picks, daily_lines = fulfilment_daily_stats(daily_start, daily_end)
     return {
         "today": today_map,
         "total": total_map,
         "week": week_map,
         "last_week": last_week_map,
+        "month": month_map,
+        "custom": custom_map,
         "today_lines": today_lines,
         "total_lines": total_lines,
         "week_lines": week_lines,
         "last_week_lines": last_week_lines,
+        "month_lines": month_lines,
+        "custom_lines": custom_lines,
+        "daily_picks": daily_picks,
+        "daily_lines": daily_lines,
         "today_sum": int(sum(today_map.values())),
         "total_sum": int(sum(total_map.values())),
         "week_sum": int(sum(week_map.values())),
         "last_week_sum": int(sum(last_week_map.values())),
+        "month_sum": int(sum(month_map.values())),
+        "custom_sum": int(sum(custom_map.values())),
         "today_lines_sum": int(sum(today_lines.values())),
         "week_lines_sum": int(sum(week_lines.values())),
+        "month_lines_sum": int(sum(month_lines.values())),
         "week_start": week_start.isoformat(),
         "week_end": week_end.isoformat(),
         "last_week_start": last_start.isoformat(),
         "last_week_end": last_end.isoformat(),
+        "month_start": month_start.isoformat(),
+        "month_end": month_end.isoformat(),
+        "custom_start": custom_start.isoformat() if (custom_from or custom_to) else "",
+        "custom_end": custom_end.isoformat() if (custom_from or custom_to) else "",
+        "daily_start": daily_start.isoformat(),
+        "daily_end": daily_end.isoformat(),
         "as_of": datetime.now().isoformat(timespec="seconds"),
     }
 

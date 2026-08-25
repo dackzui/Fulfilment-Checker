@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from datetime import date, datetime, time as dt_time
 from pathlib import Path
@@ -45,10 +47,18 @@ def _load_refresh_prefs() -> dict[str, Any]:
     seconds = int(data.get("monitor_refresh_seconds") or _REFRESH_SECONDS)
     if seconds not in _REFRESH_OPTIONS:
         seconds = _REFRESH_SECONDS
-    return {"enabled": bool(enabled), "seconds": seconds}
+    sort_by = str(data.get("monitor_leaderboard_sort") or "picks").strip().lower()
+    if sort_by not in {"picks", "lines"}:
+        sort_by = "picks"
+    return {"enabled": bool(enabled), "seconds": seconds, "sort_by": sort_by}
 
 
-def _save_refresh_prefs(*, enabled: bool, seconds: int) -> None:
+def _save_refresh_prefs(
+    *,
+    enabled: bool,
+    seconds: int,
+    sort_by: str | None = None,
+) -> None:
     path = _monitor_config_path()
     data: dict[str, Any] = {}
     if path.exists():
@@ -62,8 +72,23 @@ def _save_refresh_prefs(*, enabled: bool, seconds: int) -> None:
     data["monitor_refresh_seconds"] = (
         seconds if seconds in _REFRESH_OPTIONS else _REFRESH_SECONDS
     )
+    if sort_by is not None:
+        cleaned = str(sort_by).strip().lower()
+        data["monitor_leaderboard_sort"] = (
+            cleaned if cleaned in {"picks", "lines"} else "picks"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _normalize_leaderboard_sort(value: Any) -> str:
+    """Map dropdown value/label to ``picks`` or ``lines``."""
+    raw = str(value or "picks").strip().lower()
+    if raw in {"lines", "line", "highest lines", "highest line"}:
+        return "lines"
+    if "line" in raw:
+        return "lines"
+    return "picks"
 
 
 def _format_iso_range(start_iso: str, end_iso: str) -> str:
@@ -78,20 +103,195 @@ def _format_iso_range(start_iso: str, end_iso: str) -> str:
 def _ranked_pickers(
     rows: list[firebase_presence.UserFulfilmentRow],
     which: str,
+    *,
+    sort_by: str = "picks",
 ) -> list[tuple[str, int, int]]:
-    """Return (picker_name, picks, lines) ranked by picks then lines."""
+    """Return (picker_name, picks, lines) ordered by ``sort_by``.
+
+    ``sort_by``:
+      - ``picks`` — highest picks, then highest lines
+      - ``lines`` — highest lines, then highest picks
+    """
+    period = firebase_presence.normalize_week_filter(which)
     ranked: list[tuple[str, int, int]] = []
     for row in rows:
-        if which == "last":
+        if period == "today":
+            picks = int(row.today)
+            lines = int(row.today_lines)
+        elif period == "last":
             picks = int(row.last_week)
             lines = int(row.last_week_lines)
+        elif period == "month":
+            picks = int(row.month)
+            lines = int(row.month_lines)
+        elif period == "custom":
+            picks = int(row.custom)
+            lines = int(row.custom_lines)
         else:
             picks = int(row.week)
             lines = int(row.week_lines)
         if picks > 0 or lines > 0:
             ranked.append((row.picker_name, picks, lines))
-    ranked.sort(key=lambda item: (-item[1], -item[2], item[0].lower()))
+    return _sort_ranked(ranked, sort_by)
+
+
+def _sort_ranked(
+    ranked: list[tuple[str, int, int]],
+    sort_by: str,
+) -> list[tuple[str, int, int]]:
+    mode = _normalize_leaderboard_sort(sort_by)
+    if mode == "lines":
+        ranked.sort(key=lambda item: (-item[2], -item[1], item[0].lower()))
+    else:
+        ranked.sort(key=lambda item: (-item[1], -item[2], item[0].lower()))
     return ranked
+
+
+def _rank_maps(
+    picks: dict[str, int],
+    lines: dict[str, int],
+    sort_by: str,
+) -> list[tuple[str, int, int]]:
+    ranked: list[tuple[str, int, int]] = []
+    for name in set(picks) | set(lines):
+        p = int(picks.get(name, 0))
+        l = int(lines.get(name, 0))
+        if p > 0 or l > 0:
+            ranked.append((name, p, l))
+    return _sort_ranked(ranked, sort_by)
+
+
+def _ranges_overlap(a_start: date, a_end: date, b_start: date, b_end: date) -> bool:
+    return a_start <= b_end and b_start <= a_end
+
+
+def _synthesize_from_week_buckets(
+    rows: list[firebase_presence.UserFulfilmentRow],
+    start: date,
+    end: date,
+    sort_by: str,
+) -> list[tuple[str, int, int]]:
+    """Build a ranking from today / this-week / last-week buckets that overlap ``start``..``end``.
+
+    Used when tablets have not yet published month/custom/daily stats. Avoids
+    double-counting today (subset of this week).
+    """
+    week_start, week_end = database.week_date_bounds("this")
+    last_start, last_end = database.week_date_bounds("last")
+    today = date.today()
+
+    use_week = _ranges_overlap(start, end, week_start, week_end)
+    use_last = _ranges_overlap(start, end, last_start, last_end)
+    use_today_only = (start <= today <= end) and not use_week
+
+    picks: dict[str, int] = {}
+    lines: dict[str, int] = {}
+    for row in rows:
+        name = str(row.picker_name or "").strip()
+        if not name:
+            continue
+        p = 0
+        l = 0
+        if use_week:
+            p += int(row.week)
+            l += int(row.week_lines)
+        elif use_today_only:
+            p += int(row.today)
+            l += int(row.today_lines)
+        if use_last:
+            p += int(row.last_week)
+            l += int(row.last_week_lines)
+        if p > 0 or l > 0:
+            picks[name] = p
+            lines[name] = l
+    return _rank_maps(picks, lines, sort_by)
+
+
+def _rank_for_period(
+    snap: dict[str, Any],
+    which: str,
+    *,
+    sort_by: str = "picks",
+    custom_from: str | None = None,
+    custom_to: str | None = None,
+) -> list[tuple[str, int, int]]:
+    """Rank pickers for the selected period using the exact date bounds.
+
+    Preference order:
+      1. Summed daily heartbeat stats (exact From/To)
+      2. Local DB sessions on this PC
+      3. Dedicated month/custom/today fields when tablets publish them
+      4. Synthesize from this-week + last-week + today buckets that overlap
+    """
+    period = firebase_presence.normalize_week_filter(which)
+    start, end = database.period_date_bounds(
+        period,
+        custom_from=custom_from,
+        custom_to=custom_to,
+    )
+    presence = list(snap.get("presence") or [])
+    fulfilments = list(snap.get("fulfilments") or [])
+
+    if period in {"today", "month", "custom"}:
+        had_daily, picks, lines = firebase_presence.sum_daily_stats_for_range(
+            presence, start, end
+        )
+        if had_daily and (picks or lines):
+            return _rank_maps(picks, lines, sort_by)
+
+        local_picks, local_lines = database.fulfilment_stats_by_picker_range(start, end)
+        if local_picks or local_lines:
+            return _rank_maps(local_picks, local_lines, sort_by)
+
+        # Dedicated field from newer tablets (month / custom / today).
+        dedicated = _ranked_pickers(fulfilments, period, sort_by=sort_by)
+        if dedicated:
+            return dedicated
+
+        # Older tablets only send today/week/last_week — stitch those together.
+        synthesized = _synthesize_from_week_buckets(
+            fulfilments, start, end, sort_by
+        )
+        if synthesized:
+            return synthesized
+        return dedicated
+
+    return _ranked_pickers(fulfilments, period, sort_by=sort_by)
+
+
+_PERIOD_OPTIONS = (
+    ("today", "Today"),
+    ("this", "This week"),
+    ("last", "Last week"),
+    ("month", "This month"),
+    ("custom", "Custom dates"),
+)
+
+
+def _format_display_date(value: date | None) -> str:
+    if value is None:
+        return ""
+    return value.strftime("%d/%m/%Y")
+
+
+def _parse_iso_or_display(value: str | None) -> date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        pass
+    parts = raw.replace("-", "/").split("/")
+    if len(parts) == 3:
+        try:
+            day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+            if year < 100:
+                year += 2000
+            return date(year, month, day)
+        except ValueError:
+            return None
+    return None
 
 
 def _online_pickers(
@@ -132,7 +332,11 @@ def _online_pickers(
             row["today_lines"] = int(row["today_lines"]) + qty
     rows = list(by_name.values())
     rows.sort(
-        key=lambda item: (-int(item["today"]), str(item["picker_name"]).lower())
+        key=lambda item: (
+            -int(item["today"]),
+            -int(item.get("today_lines") or 0),
+            str(item["picker_name"]).lower(),
+        )
     )
     return rows
 
@@ -143,16 +347,44 @@ def _format_picks_lines(picks: int, lines: int) -> str:
     return f"{pick_bit} · {line_bit}"
 
 
-def _monitor_bar_chart(rows: list[tuple[str, int, int]]) -> ft.Control:
+def _metric_bar(*, value: int, max_value: int, color: str, height: int = 18) -> ft.Control:
+    max_value = max(1, int(max_value))
+    width_frac = max(0.06, min(1.0, int(value) / max_value)) if value > 0 else 0.0
+    return ft.Container(
+        content=ft.Container(
+            bgcolor=color if value > 0 else "#ECEFF1",
+            border_radius=5,
+            height=height,
+        ),
+        bgcolor="#ECEFF1",
+        border_radius=5,
+        height=height,
+        width=float(720 * width_frac) if value > 0 else 8,
+    )
+
+
+def _monitor_bar_chart(
+    rows: list[tuple[str, int, int]],
+    *,
+    sort_by: str = "picks",
+) -> ft.Control:
+    """Leaderboard dual bars; order follows ``sort_by`` (picks or lines)."""
     if not rows:
         return muted("No pickups recorded for this period yet.")
 
-    max_count = max(picks for _, picks, _ in rows) or 1
+    mode = _normalize_leaderboard_sort(sort_by)
+    if mode == "lines":
+        rows = sorted(rows, key=lambda item: (-item[2], -item[1], item[0].lower()))
+    else:
+        rows = sorted(rows, key=lambda item: (-item[1], -item[2], item[0].lower()))
+    max_picks = max((picks for _, picks, _ in rows), default=0) or 1
+    max_lines = max((lines for _, _, lines in rows), default=0) or 1
+
     bars: list[ft.Control] = []
     for index, (name, picks, lines) in enumerate(rows):
         is_top = index == 0
-        width_frac = max(0.08, picks / max_count)
-        color = "#F9A825" if is_top else _BAR_COLORS[index % len(_BAR_COLORS)]
+        picks_color = "#F9A825" if is_top else "#1E88E5"
+        lines_color = "#FFB300" if is_top else "#43A047"
         name_row: list[ft.Control] = []
         if is_top:
             name_row.append(ft.Text(_CROWN, size=22, font_family=FONT_FAMILY))
@@ -188,16 +420,43 @@ def _monitor_bar_chart(rows: list[tuple[str, int, int]]) -> ft.Control:
                             spacing=8,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
-                        ft.Container(
-                            content=ft.Container(
-                                bgcolor=color,
-                                border_radius=6,
-                                height=28 if is_top else 20,
-                            ),
-                            bgcolor="#ECEFF1",
-                            border_radius=6,
-                            height=28 if is_top else 20,
-                            width=float(720 * width_frac),
+                        ft.Row(
+                            [
+                                ft.Text(
+                                    "Picks",
+                                    size=12,
+                                    width=48,
+                                    color="#616161",
+                                    font_family=FONT_FAMILY,
+                                ),
+                                _metric_bar(
+                                    value=picks,
+                                    max_value=max_picks,
+                                    color=picks_color,
+                                    height=22 if is_top else 16,
+                                ),
+                            ],
+                            spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        ft.Row(
+                            [
+                                ft.Text(
+                                    "Lines",
+                                    size=12,
+                                    width=48,
+                                    color="#616161",
+                                    font_family=FONT_FAMILY,
+                                ),
+                                _metric_bar(
+                                    value=lines,
+                                    max_value=max_lines,
+                                    color=lines_color,
+                                    height=22 if is_top else 16,
+                                ),
+                            ],
+                            spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                     ],
                     spacing=8,
@@ -247,6 +506,13 @@ async def main(page: ft.Page):
 
     def stop_refresh():
         page._monitor_token = None
+        callback = getattr(page, "_monitor_live_callback", None)
+        if callback is not None:
+            try:
+                firebase_presence.stop_presence_listener(callback)
+            except Exception:
+                pass
+            page._monitor_live_callback = None
 
     def build_login() -> ft.Control:
         username_field = ft.TextField(label="Username", autofocus=True, width=360)
@@ -343,21 +609,50 @@ async def main(page: ft.Page):
         status_label = muted("Loading…")
 
         # --- Board controls ---
-        range_label = muted("Week: —")
+        range_label = muted("Period: —")
         prize_banner = ft.Container(visible=False)
         chart_host = ft.Column(spacing=12, tight=True)
         online_pickers_list = ft.Column(spacing=8, tight=True)
         top_label = ft.Text("", size=20, weight=ft.FontWeight.W_600, font_family=FONT_FAMILY)
         week_dropdown = ft.Dropdown(
-            label="Week filter",
+            label="Period",
             width=220,
             value="this",
-            visible=can_edit,
-            disabled=not can_edit,
             options=[
-                ft.DropdownOption(key="this", text="This week"),
-                ft.DropdownOption(key="last", text="Last week"),
+                ft.DropdownOption(key=key, text=label)
+                for key, label in _PERIOD_OPTIONS
             ],
+        )
+        custom_from_field = ft.TextField(
+            label="From",
+            width=150,
+            dense=True,
+            read_only=True,
+            hint_text="dd/mm/yyyy",
+            visible=False,
+        )
+        custom_to_field = ft.TextField(
+            label="To",
+            width=150,
+            dense=True,
+            read_only=True,
+            hint_text="dd/mm/yyyy",
+            visible=False,
+        )
+        custom_apply_btn = ft.OutlinedButton(
+            "Apply dates",
+            icon=ft.Icons.DATE_RANGE,
+            visible=False,
+        )
+        custom_dates_row = ft.Row(
+            [
+                custom_from_field,
+                custom_to_field,
+                custom_apply_btn,
+            ],
+            spacing=10,
+            wrap=True,
+            visible=False,
         )
 
         # --- Settings controls ---
@@ -370,12 +665,12 @@ async def main(page: ft.Page):
             width=560,
         )
         settings_week_dropdown = ft.Dropdown(
-            label="Week filter",
+            label="Period",
             width=220,
             value="this",
             options=[
-                ft.DropdownOption(key="this", text="This week"),
-                ft.DropdownOption(key="last", text="Last week"),
+                ft.DropdownOption(key=key, text=label)
+                for key, label in _PERIOD_OPTIONS
             ],
         )
         settings_status = muted("")
@@ -413,15 +708,27 @@ async def main(page: ft.Page):
         fleet_status = muted(firebase_presence.fleet_sync_status_text())
         fleet_backup_list = ft.Column(spacing=6, tight=True)
 
-        filter_state = {"value": "this", "prize": ""}
         refresh_prefs = _load_refresh_prefs()
+        filter_state = {
+            "value": "this",
+            "prize": "",
+            "sort_by": str(refresh_prefs.get("sort_by") or "picks"),
+            "custom_from": "",
+            "custom_to": "",
+        }
         refresh_state = {
             "enabled": bool(refresh_prefs["enabled"]),
             "seconds": int(refresh_prefs["seconds"]),
             "last_at": None,
         }
+        latest_snap: dict[str, Any] = {"value": None}
         refresh_token = time.time()
         page._monitor_token = refresh_token
+        refresh_wake = threading.Event()
+
+        def bump_refresh() -> None:
+            """Wake the auto-refresh loop so the new interval/toggle applies now."""
+            refresh_wake.set()
 
         auto_refresh_switch = ft.Switch(
             label="Auto refresh",
@@ -438,6 +745,15 @@ async def main(page: ft.Page):
             ],
         )
         last_refresh_label = muted("Last updated: —")
+        leaderboard_sort_dropdown = ft.Dropdown(
+            label="Order by",
+            width=200,
+            value=str(filter_state.get("sort_by") or "picks"),
+            options=[
+                ft.DropdownOption(key="picks", text="Highest picks"),
+                ft.DropdownOption(key="lines", text="Highest lines"),
+            ],
+        )
 
         def render_prize_banner(message: str, top_name: str | None) -> None:
             text = (message or "").strip()
@@ -520,31 +836,98 @@ async def main(page: ft.Page):
                     )
                 )
 
+        def sync_custom_date_controls(*, which: str | None = None) -> None:
+            period = firebase_presence.normalize_week_filter(
+                which or filter_state.get("value") or "this"
+            )
+            show_custom = period == "custom"
+            custom_dates_row.visible = show_custom
+            custom_from_field.visible = show_custom
+            custom_to_field.visible = show_custom
+            custom_apply_btn.visible = show_custom
+            from_iso = str(filter_state.get("custom_from") or "")
+            to_iso = str(filter_state.get("custom_to") or "")
+            custom_from_field.value = _format_display_date(_parse_iso_or_display(from_iso))
+            custom_to_field.value = _format_display_date(_parse_iso_or_display(to_iso))
+
         def apply_snapshot(snap: dict) -> None:
-            which = str(snap.get("week_filter") or filter_state["value"] or "this")
+            latest_snap["value"] = snap
+            # Super Admin follows shared Firebase period; Monitor Viewer keeps
+            # their own local period choice (auto-refresh must not reset it).
+            if can_edit:
+                which = firebase_presence.normalize_week_filter(
+                    snap.get("week_filter") or filter_state["value"] or "this"
+                )
+                filter_state["custom_from"] = str(
+                    snap.get("custom_date_from")
+                    or filter_state.get("custom_from")
+                    or ""
+                )
+                filter_state["custom_to"] = str(
+                    snap.get("custom_date_to")
+                    or filter_state.get("custom_to")
+                    or ""
+                )
+            else:
+                which = firebase_presence.normalize_week_filter(
+                    filter_state.get("value") or snap.get("week_filter") or "this"
+                )
+                if not filter_state.get("custom_from"):
+                    filter_state["custom_from"] = str(
+                        snap.get("custom_date_from") or ""
+                    )
+                if not filter_state.get("custom_to"):
+                    filter_state["custom_to"] = str(
+                        snap.get("custom_date_to") or ""
+                    )
             prize = str(snap.get("prize_message") or "")
+            # Dropdown is source of truth so Order by always matches the graph.
+            sort_by = _normalize_leaderboard_sort(
+                leaderboard_sort_dropdown.value or filter_state.get("sort_by")
+            )
             filter_state["value"] = which
             filter_state["prize"] = prize
+            filter_state["sort_by"] = sort_by
             if week_dropdown.value != which:
                 week_dropdown.value = which
             if settings_week_dropdown.value != which:
                 settings_week_dropdown.value = which
+            if leaderboard_sort_dropdown.value != sort_by:
+                leaderboard_sort_dropdown.value = sort_by
             if prize_field.value != prize:
                 prize_field.value = prize
+            sync_custom_date_controls(which=which)
 
-            range_text = _format_iso_range(
-                str(snap.get("week_start") or ""),
-                str(snap.get("week_end") or ""),
-            )
-            label = "Last week" if which == "last" else "This week"
+            try:
+                start, end = database.period_date_bounds(
+                    which,
+                    custom_from=filter_state.get("custom_from") or None,
+                    custom_to=filter_state.get("custom_to") or None,
+                )
+                range_text = _format_iso_range(start.isoformat(), end.isoformat())
+            except Exception:
+                range_text = _format_iso_range(
+                    str(snap.get("week_start") or ""),
+                    str(snap.get("week_end") or ""),
+                )
+            label = firebase_presence.period_label(which)
             range_label.value = f"{label}: {range_text}" if range_text else label
 
-            ranked = _ranked_pickers(list(snap.get("fulfilments") or []), which)
-            chart_host.controls = [_monitor_bar_chart(ranked[:12])]
+            ranked = _rank_for_period(
+                snap,
+                which,
+                sort_by=sort_by,
+                custom_from=str(filter_state.get("custom_from") or "") or None,
+                custom_to=str(filter_state.get("custom_to") or "") or None,
+            )
+            chart_host.controls = [
+                _monitor_bar_chart(ranked[:12], sort_by=sort_by)
+            ]
             if ranked:
                 top_name, top_picks, top_lines = ranked[0]
+                metric = "lines" if sort_by == "lines" else "picks"
                 top_label.value = (
-                    f"{_CROWN}  #1 {top_name}  —  "
+                    f"{_CROWN}  #1 by {metric}: {top_name}  —  "
                     f"{_format_picks_lines(top_picks, top_lines)}"
                 )
                 render_prize_banner(prize, top_name)
@@ -557,13 +940,19 @@ async def main(page: ft.Page):
             now = datetime.now().strftime("%H:%M:%S")
             refresh_state["last_at"] = now
             interval = int(refresh_state["seconds"])
-            if refresh_state["enabled"]:
+            live = bool(
+                firebase_presence.presence_listener_active()
+                or snap.get("source") == "firebase-live"
+            )
+            if live:
+                last_refresh_label.value = f"Live · updated {now}"
+            elif refresh_state["enabled"]:
                 last_refresh_label.value = (
-                    f"Last updated: {now} · auto every {interval}s"
+                    f"Last updated: {now} · backup poll every {interval}s"
                 )
             else:
                 last_refresh_label.value = (
-                    f"Last updated: {now} · auto refresh off"
+                    f"Last updated: {now} · live off / auto refresh off"
                 )
 
             if snap.get("configured"):
@@ -588,14 +977,14 @@ async def main(page: ft.Page):
                 try:
                     if firebase_presence.is_configured():
                         try:
-                            firebase_presence.publish_heartbeat(
+                            firebase_presence.publish_heartbeat_async(
                                 username=admin_name,
                                 role=admin_role,
                                 online=True,
                             )
                         except Exception:
                             pass
-                    snap = firebase_presence.dashboard_snapshot()
+                    snap = firebase_presence.dashboard_snapshot(force_refresh=True)
 
                     def apply():
                         if getattr(page, "_monitor_token", None) != refresh_token:
@@ -618,9 +1007,35 @@ async def main(page: ft.Page):
                 _save_refresh_prefs(
                     enabled=bool(refresh_state["enabled"]),
                     seconds=int(refresh_state["seconds"]),
+                    sort_by=str(filter_state.get("sort_by") or "picks"),
                 )
             except Exception:
                 pass
+
+        def on_leaderboard_sort_change(e=None):
+            chosen = _normalize_leaderboard_sort(
+                getattr(e.control, "value", None)
+                if e is not None
+                else leaderboard_sort_dropdown.value
+            )
+            filter_state["sort_by"] = chosen
+            leaderboard_sort_dropdown.value = chosen
+            persist_refresh_prefs()
+            snap = latest_snap.get("value")
+            try:
+                if isinstance(snap, dict):
+                    apply_snapshot(snap)
+                # Keep existing chart if snapshot is not ready yet — do not clear it.
+            except Exception as exc:
+                status_label.value = f"Could not reorder leaderboard: {exc}"
+            show_snack(
+                "Leaderboard ordered by highest lines."
+                if chosen == "lines"
+                else "Leaderboard ordered by highest picks."
+            )
+            page.update()
+
+        leaderboard_sort_dropdown.on_select = on_leaderboard_sort_change
 
         def on_auto_refresh_toggle(e):
             refresh_state["enabled"] = bool(e.control.value)
@@ -632,6 +1047,7 @@ async def main(page: ft.Page):
                     f"Last updated: {stamp} · auto every {interval}s"
                 )
                 show_snack(f"Auto refresh on — every {interval}s.")
+                bump_refresh()
             else:
                 last_refresh_label.value = (
                     f"Last updated: {stamp} · auto refresh off"
@@ -655,45 +1071,168 @@ async def main(page: ft.Page):
                     f"Last updated: {stamp} · auto every {seconds}s"
                 )
             show_snack(f"Auto refresh interval set to {seconds}s.")
+            bump_refresh()
             page.update()
 
         auto_refresh_switch.on_change = on_auto_refresh_toggle
-        refresh_interval_dropdown.on_change = on_refresh_interval_change
+        refresh_interval_dropdown.on_select = on_refresh_interval_change
 
-        def save_week_filter(chosen: str):
+        def save_week_filter(
+            chosen: str,
+            *,
+            custom_from: str | None = None,
+            custom_to: str | None = None,
+        ):
+            chosen = firebase_presence.normalize_week_filter(chosen)
+            week_dropdown.value = chosen
+            settings_week_dropdown.value = chosen
+            filter_state["value"] = chosen
+            if custom_from is not None:
+                filter_state["custom_from"] = (
+                    _parse_iso_or_display(custom_from).isoformat()
+                    if _parse_iso_or_display(custom_from)
+                    else ""
+                )
+            if custom_to is not None:
+                filter_state["custom_to"] = (
+                    _parse_iso_or_display(custom_to).isoformat()
+                    if _parse_iso_or_display(custom_to)
+                    else ""
+                )
+            if chosen == "custom" and not (
+                filter_state.get("custom_from") and filter_state.get("custom_to")
+            ):
+                today_iso = date.today().isoformat()
+                filter_state["custom_from"] = filter_state.get("custom_from") or today_iso
+                filter_state["custom_to"] = filter_state.get("custom_to") or today_iso
+            sync_custom_date_controls(which=chosen)
+
+            def apply_local_preview() -> None:
+                snap = latest_snap.get("value")
+                if not isinstance(snap, dict):
+                    return
+                start, end = database.period_date_bounds(
+                    chosen,
+                    custom_from=filter_state.get("custom_from") or None,
+                    custom_to=filter_state.get("custom_to") or None,
+                )
+                preview = dict(snap)
+                preview["week_filter"] = chosen
+                preview["week_start"] = start.isoformat()
+                preview["week_end"] = end.isoformat()
+                preview["custom_date_from"] = filter_state.get("custom_from") or ""
+                preview["custom_date_to"] = filter_state.get("custom_to") or ""
+                apply_snapshot(preview)
+
+            # Monitor Viewer: local view only — do not change shared Firebase period.
             if not can_edit:
-                show_snack("View-only accounts cannot change settings.", error=True)
-                week_dropdown.value = filter_state["value"]
-                settings_week_dropdown.value = filter_state["value"]
+                try:
+                    apply_local_preview()
+                    show_snack(
+                        f"Showing {firebase_presence.period_label(chosen).lower()} "
+                        "(this screen only)."
+                    )
+                except Exception as exc:
+                    show_snack(f"Could not change period: {exc}", error=True)
                 page.update()
                 return
-            chosen = "last" if chosen == "last" else "this"
+
+            # Instant UI while Super Admin save runs.
+            try:
+                apply_local_preview()
+                page.update()
+            except Exception:
+                pass
 
             def work():
                 try:
                     firebase_presence.save_dashboard_settings(
                         week_filter=chosen,
+                        custom_date_from=str(filter_state.get("custom_from") or ""),
+                        custom_date_to=str(filter_state.get("custom_to") or ""),
                         updated_by=admin_name,
                     )
-                    filter_state["value"] = chosen
                     snap = firebase_presence.dashboard_snapshot()
 
                     def apply():
                         apply_snapshot(snap)
-                        show_snack("Week filter updated.")
+                        show_snack(
+                            f"Showing {firebase_presence.period_label(chosen).lower()}."
+                        )
                         page.update()
+                        bump_refresh()
 
                     apply()
                 except Exception as exc:
-                    show_snack(f"Could not save week filter: {exc}", error=True)
+                    show_snack(f"Could not save period filter: {exc}", error=True)
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
 
             page.run_thread(work)
 
         def on_week_change(e):
-            save_week_filter((e.control.value or "this").strip().lower())
+            save_week_filter(
+                getattr(e.control, "value", None) or week_dropdown.value or "this"
+            )
 
         def on_settings_week_change(e):
-            save_week_filter((e.control.value or "this").strip().lower())
+            save_week_filter(
+                getattr(e.control, "value", None)
+                or settings_week_dropdown.value
+                or "this"
+            )
+
+        def _open_custom_date_picker(*, which: str):
+            field = custom_from_field if which == "from" else custom_to_field
+
+            def _end_of_today() -> datetime:
+                return datetime.combine(date.today(), datetime.max.time())
+
+            picker = ft.DatePicker(
+                help_text="Select date",
+                entry_mode=ft.DatePickerEntryMode.CALENDAR,
+                locale=ft.Locale("en", "AU"),
+                first_date=date(2020, 1, 1),
+                last_date=_end_of_today(),
+                current_date=date.today(),
+            )
+            parsed = _parse_iso_or_display(field.value)
+            picker.value = datetime.combine(
+                parsed or date.today(),
+                datetime.min.time(),
+            )
+
+            def on_picked(_=None):
+                selected = picker.value
+                if isinstance(selected, datetime):
+                    selected = selected.date()
+                if isinstance(selected, date):
+                    field.value = _format_display_date(selected)
+                page.pop_dialog()
+                # Re-rank as soon as both ends are set.
+                if (custom_from_field.value or "").strip() and (
+                    custom_to_field.value or ""
+                ).strip():
+                    apply_custom_dates()
+                else:
+                    page.update()
+
+            picker.on_change = on_picked
+            page.show_dialog(picker)
+
+        custom_from_field.on_click = lambda _: _open_custom_date_picker(which="from")
+        custom_to_field.on_click = lambda _: _open_custom_date_picker(which="to")
+
+        def apply_custom_dates(_=None):
+            save_week_filter(
+                "custom",
+                custom_from=custom_from_field.value or "",
+                custom_to=custom_to_field.value or "",
+            )
+
+        custom_apply_btn.on_click = apply_custom_dates
 
         def save_prize(_=None):
             if not can_edit:
@@ -1191,6 +1730,7 @@ async def main(page: ft.Page):
             save_fleet_settings()
 
         fleet_enabled_switch.on_change = on_fleet_switch
+        # Dropdowns use on_select in Flet 0.85+ (on_change is ignored).
 
         def on_fleet_output_change(_=None):
             if not can_edit:
@@ -1200,7 +1740,7 @@ async def main(page: ft.Page):
                 return
             save_fleet_settings()
 
-        fleet_output_dropdown.on_change = on_fleet_output_change
+        fleet_output_dropdown.on_select = on_fleet_output_change
 
         def open_fleet_time_picker(_=None):
             if not can_edit:
@@ -1814,8 +2354,8 @@ async def main(page: ft.Page):
                 ),
             )
 
-        week_dropdown.on_change = on_week_change
-        settings_week_dropdown.on_change = on_settings_week_change
+        week_dropdown.on_select = on_week_change
+        settings_week_dropdown.on_select = on_settings_week_change
 
         def board_view() -> ft.Control:
             return ft.Column(
@@ -1828,6 +2368,7 @@ async def main(page: ft.Page):
                         wrap=True,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
+                    custom_dates_row,
                     ft.Divider(height=8, color=ft.Colors.TRANSPARENT),
                     ft.Text(
                         "Online pickers",
@@ -1846,8 +2387,16 @@ async def main(page: ft.Page):
                         weight=ft.FontWeight.W_600,
                         font_family=FONT_FAMILY,
                     ),
-                    muted(
-                        "Completed picks and ticket lines per picker for the selected week."
+                    ft.Row(
+                        [
+                            muted(
+                                "Each picker shows Picks and Lines bars. Choose order below."
+                            ),
+                            leaderboard_sort_dropdown,
+                        ],
+                        spacing=16,
+                        wrap=True,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     ft.Container(content=chart_host, expand=True),
                 ],
@@ -1874,11 +2423,14 @@ async def main(page: ft.Page):
                         content=ft.Column(
                             [
                                 ft.Text(
-                                    "Week filter",
+                                    "Period filter",
                                     weight=ft.FontWeight.W_600,
                                     font_family=FONT_FAMILY,
                                 ),
-                                muted("Controls the leaderboard period on the board and Home."),
+                                muted(
+                                    "Today, this/last week, this month, or custom dates. "
+                                    "Shared with Home on tablets."
+                                ),
                                 settings_week_dropdown,
                             ],
                             spacing=10,
@@ -1944,44 +2496,108 @@ async def main(page: ft.Page):
             )
             page.update()
 
-        def auto_loop():
+        async def auto_loop():
             while getattr(page, "_monitor_token", None) == refresh_token:
                 try:
                     if refresh_state["enabled"]:
-                        if firebase_presence.is_configured():
-                            try:
-                                firebase_presence.publish_heartbeat(
-                                    username=admin_name,
-                                    role=admin_role,
-                                    online=True,
-                                )
-                            except Exception:
-                                pass
-                        snap = firebase_presence.dashboard_snapshot()
 
-                        def apply():
-                            if getattr(page, "_monitor_token", None) != refresh_token:
-                                return
-                            apply_snapshot(snap)
-                            page.update()
+                        def work():
+                            if firebase_presence.is_configured():
+                                try:
+                                    firebase_presence.publish_heartbeat_async(
+                                        username=admin_name,
+                                        role=admin_role,
+                                        online=True,
+                                    )
+                                except Exception:
+                                    pass
+                            # Backup poll — live SSE is preferred when connected.
+                            return firebase_presence.dashboard_snapshot(
+                                force_refresh=True
+                            )
 
-                        apply()
-                except Exception as exc:
-
-                    def show_err(message=str(exc)):
+                        snap = await asyncio.to_thread(work)
                         if getattr(page, "_monitor_token", None) != refresh_token:
                             return
-                        status_label.value = f"Refresh failed: {message}"
+                        apply_snapshot(snap)
                         page.update()
-
-                    show_err()
-                wait_for = max(5, int(refresh_state.get("seconds") or _REFRESH_SECONDS))
-                for _ in range(wait_for):
+                except Exception as exc:
                     if getattr(page, "_monitor_token", None) != refresh_token:
                         return
-                    time.sleep(1)
+                    status_label.value = f"Refresh failed: {exc}"
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
 
-        page.run_thread(auto_loop)
+                wait_for = max(5, int(refresh_state.get("seconds") or _REFRESH_SECONDS))
+                # When the real-time listener is healthy, poll only as a safety net.
+                if firebase_presence.presence_listener_active():
+                    wait_for = max(wait_for, 60)
+                refresh_wake.clear()
+                elapsed = 0.0
+                while elapsed < wait_for:
+                    if getattr(page, "_monitor_token", None) != refresh_token:
+                        return
+                    if refresh_wake.is_set():
+                        refresh_wake.clear()
+                        break
+                    await asyncio.sleep(0.5)
+                    elapsed += 0.5
+
+        live_apply_pending = {"busy": False, "dirty": False}
+
+        def on_live_presence_change() -> None:
+            """Firebase SSE pushed a presence change — refresh board immediately."""
+
+            async def apply_live():
+                try:
+                    while live_apply_pending["dirty"]:
+                        live_apply_pending["dirty"] = False
+                        if getattr(page, "_monitor_token", None) != refresh_token:
+                            return
+                        snap = await asyncio.to_thread(
+                            lambda: firebase_presence.dashboard_snapshot(
+                                force_refresh=False
+                            )
+                        )
+                        if getattr(page, "_monitor_token", None) != refresh_token:
+                            return
+                        apply_snapshot(snap)
+                        page.update()
+                except Exception as exc:
+                    if getattr(page, "_monitor_token", None) != refresh_token:
+                        return
+                    status_label.value = f"Live update failed: {exc}"
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
+                finally:
+                    live_apply_pending["busy"] = False
+                    if live_apply_pending["dirty"] and (
+                        getattr(page, "_monitor_token", None) == refresh_token
+                    ):
+                        live_apply_pending["busy"] = True
+                        page.run_task(apply_live)
+
+            live_apply_pending["dirty"] = True
+            if getattr(page, "_monitor_token", None) != refresh_token:
+                return
+            if live_apply_pending["busy"]:
+                return
+            live_apply_pending["busy"] = True
+            page.run_task(apply_live)
+
+        page._monitor_live_callback = on_live_presence_change
+        if firebase_presence.is_configured():
+            try:
+                firebase_presence.start_presence_listener(on_live_presence_change)
+                last_refresh_label.value = "Live · connecting…"
+            except Exception:
+                last_refresh_label.value = "Live listener unavailable — using poll"
+
+        page.run_task(auto_loop)
 
         header_actions = [
             auto_refresh_switch,
@@ -2011,8 +2627,8 @@ async def main(page: ft.Page):
                             [
                                 title,
                                 muted(
-                                    "Live ranking for monitoring — leaderboard and online "
-                                    "pickers refresh automatically."
+                                    "Live Firebase updates — rankings change as soon as "
+                                    "tablets publish. Auto refresh is a backup poll."
                                     + (
                                         ""
                                         if can_edit

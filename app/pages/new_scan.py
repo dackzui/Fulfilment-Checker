@@ -730,6 +730,325 @@ def build(
         sync_ticket_quantities()
         refresh_table()
 
+    def append_missing_ticket_line(
+        part_no: str,
+        qty: int,
+        *,
+        description: str = "",
+        pick_bay: str = "",
+    ) -> PickingTicketItem:
+        if picking_ticket is None:
+            raise ValueError("No picking ticket loaded.")
+        item = PickingTicketItem(
+            part_no=part_no.strip(),
+            description=(description or "").strip() or "Added by checker",
+            qty_ordered=max(1, int(qty)),
+            pick_bay=(pick_bay or "").strip(),
+        )
+        picking_ticket.items.append(item)
+        return item
+
+    def open_confirm_add_ticket_line(
+        part_no: str,
+        *,
+        suggested_qty: int,
+        description: str,
+        checker_name: str,
+        resume_barcode: str | None = None,
+        resume_manual: bool = False,
+        part_editable: bool = False,
+    ) -> None:
+        part_field = ft.TextField(
+            label="Item Part No.",
+            value=part_no or "",
+            autofocus=True,
+            read_only=not part_editable and bool(part_no),
+        )
+        qty_confirm = ft.TextField(
+            label="Qty Ordered",
+            value=str(max(1, suggested_qty)),
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        desc_field = ft.TextField(
+            label="Description (optional)",
+            value=description or "",
+        )
+        status = muted(f"Authorized by {checker_name}")
+
+        def close_add(_=None):
+            page.pop_dialog()
+            focus_scan_field()
+            page.update()
+
+        def save_line(_=None):
+            part = (part_field.value or "").strip()
+            if not part:
+                status.value = "Item Part No. is required."
+                page.update()
+                return
+            try:
+                line_qty = max(1, int((qty_confirm.value or "1").strip()))
+            except ValueError:
+                status.value = "Qty must be a whole number."
+                page.update()
+                return
+            if picking_ticket is None:
+                status.value = "No picking ticket loaded."
+                page.update()
+                return
+            if find_ticket_item(picking_ticket.items, part):
+                status.value = f"Part '{part}' is already on Items Ordered."
+                page.update()
+                return
+            try:
+                append_missing_ticket_line(
+                    part,
+                    line_qty,
+                    description=(desc_field.value or "").strip(),
+                )
+            except Exception as exc:
+                status.value = str(exc)
+                page.update()
+                return
+            page.pop_dialog()
+            sync_ticket_quantities()
+            refresh_table()
+            show_snack(
+                f"Added part {part} (qty {line_qty}) to Items Ordered "
+                f"(checker: {checker_name})."
+            )
+            if resume_barcode:
+                process_barcode(resume_barcode)
+            elif resume_manual:
+                add_manual_item()
+            else:
+                focus_scan_field()
+            page.update()
+
+        part_field.on_submit = save_line
+        qty_confirm.on_submit = save_line
+
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Add missing ticket line"),
+                content=ft.Column(
+                    [
+                        muted(
+                            "Use this when the PDF missed a line on Items Ordered. "
+                            "The line is added for this scan only."
+                        ),
+                        part_field,
+                        qty_confirm,
+                        desc_field,
+                        status,
+                    ],
+                    tight=True,
+                    spacing=12,
+                    width=380,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=close_add),
+                    ft.ElevatedButton(
+                        "Add line",
+                        bgcolor=PRIMARY,
+                        color=ft.Colors.WHITE,
+                        on_click=save_line,
+                    ),
+                ],
+            )
+        )
+        page.update()
+
+    def open_checker_login_for_ticket_line(
+        part_no: str,
+        *,
+        suggested_qty: int,
+        description: str,
+        resume_barcode: str | None = None,
+        resume_manual: bool = False,
+        part_editable: bool = False,
+    ) -> None:
+        username_field = ft.TextField(label="Checker username", autofocus=True)
+        password_field = ft.TextField(
+            label="Password",
+            password=True,
+            can_reveal_password=True,
+        )
+        status = muted("")
+
+        def close_login(_=None):
+            page.pop_dialog()
+            focus_scan_field()
+            page.update()
+
+        def submit_checker(_=None):
+            name = (username_field.value or "").strip()
+            password = password_field.value or ""
+            account = auth.authenticate_ticket_checker(name, password)
+            if not account:
+                probe = auth.authenticate(name, password)
+                if probe and not auth.can_add_missing_ticket_line(probe.role):
+                    status.value = (
+                        "This account cannot add ticket lines. "
+                        "Sign in with an Admin or Super Admin (checker) account."
+                    )
+                else:
+                    status.value = "Invalid username or password."
+                page.update()
+                return
+            page.pop_dialog()
+            open_confirm_add_ticket_line(
+                part_no,
+                suggested_qty=suggested_qty,
+                description=description,
+                checker_name=account.username,
+                resume_barcode=resume_barcode,
+                resume_manual=resume_manual,
+                part_editable=part_editable,
+            )
+
+        password_field.on_submit = submit_checker
+
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Checker login"),
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Admin / Super Admin login required to add a line "
+                            "missing from Items Ordered. "
+                            "This does not change who is signed in for the scan.",
+                            size=13,
+                            font_family=FONT_FAMILY,
+                        ),
+                        username_field,
+                        password_field,
+                        status,
+                    ],
+                    tight=True,
+                    spacing=12,
+                    width=360,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=close_login),
+                    ft.ElevatedButton(
+                        "Continue",
+                        bgcolor=PRIMARY,
+                        color=ft.Colors.WHITE,
+                        on_click=submit_checker,
+                    ),
+                ],
+            )
+        )
+        page.update()
+
+    def start_checker_add_ticket_line(
+        part_no: str,
+        *,
+        suggested_qty: int = 1,
+        description: str = "",
+        resume_barcode: str | None = None,
+        resume_manual: bool = False,
+        part_editable: bool = False,
+    ) -> None:
+        username, role = current_session()
+        if auth.can_add_missing_ticket_line(role):
+            open_confirm_add_ticket_line(
+                part_no,
+                suggested_qty=suggested_qty,
+                description=description,
+                checker_name=username or "Checker",
+                resume_barcode=resume_barcode,
+                resume_manual=resume_manual,
+                part_editable=part_editable,
+            )
+            return
+        open_checker_login_for_ticket_line(
+            part_no,
+            suggested_qty=suggested_qty,
+            description=description,
+            resume_barcode=resume_barcode,
+            resume_manual=resume_manual,
+            part_editable=part_editable,
+        )
+
+    def open_missing_ticket_line_dialog(
+        part_no: str,
+        *,
+        suggested_qty: int = 1,
+        description: str = "",
+        resume_barcode: str | None = None,
+        resume_manual: bool = False,
+    ) -> None:
+        if picking_ticket is None:
+            show_snack("Upload a picking ticket first.", error=True)
+            return
+
+        def close_prompt(_=None):
+            page.pop_dialog()
+            focus_scan_field()
+            page.update()
+
+        def start_add(_=None):
+            page.pop_dialog()
+            start_checker_add_ticket_line(
+                part_no,
+                suggested_qty=suggested_qty,
+                description=description,
+                resume_barcode=resume_barcode,
+                resume_manual=resume_manual,
+                part_editable=False,
+            )
+
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Line not on picking ticket"),
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            f"Part “{part_no}” is not on Items Ordered.",
+                            size=14,
+                            font_family=FONT_FAMILY,
+                        ),
+                        ft.Text(
+                            "The PDF may have missed this row. "
+                            "A checker (Admin) can add the line so scanning can continue.",
+                            size=13,
+                            font_family=FONT_FAMILY,
+                            color="#616161",
+                        ),
+                    ],
+                    tight=True,
+                    spacing=10,
+                    width=360,
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=close_prompt),
+                    ft.ElevatedButton(
+                        "Checker add line",
+                        bgcolor=PRIMARY,
+                        color=ft.Colors.WHITE,
+                        on_click=start_add,
+                    ),
+                ],
+            )
+        )
+        page.update()
+
+    def add_ticket_line_button_click(_=None):
+        if picking_ticket is None:
+            show_snack("Upload a picking ticket first.", error=True)
+            return
+        start_checker_add_ticket_line(
+            "",
+            suggested_qty=1,
+            description="",
+            part_editable=True,
+        )
+
     def process_barcode(code: str):
         code = barcode_catalog.normalize_scanned_code(code)
         if not code:
@@ -756,8 +1075,14 @@ def build(
                 error=True,
             )
             return
-        elif match_status == "not_on_ticket":
-            show_snack(f"Part '{part_no}' is not on the picking ticket.", error=True)
+        if match_status == "not_on_ticket":
+            open_missing_ticket_line_dialog(
+                part_no,
+                suggested_qty=qty,
+                description=description,
+                resume_barcode=code,
+            )
+            return
         elif match_status == "qty_exceeded":
             total_ordered = (
                 total_qty_ordered_for_part(picking_ticket.items, part_no)
@@ -886,10 +1211,13 @@ def build(
         match_status = result["match_status"]
 
         if match_status == "not_on_ticket":
-            show_snack(
-                f"Part '{part_no}' is not on the picking ticket. "
-                "Check the part number or upload the correct PDF.",
-                error=True,
+            open_missing_ticket_line_dialog(
+                part_no,
+                suggested_qty=qty,
+                description=(
+                    description if description != "Not on picking ticket" else ""
+                ),
+                resume_manual=True,
             )
             return
         if match_status == "qty_exceeded":
@@ -1345,6 +1673,12 @@ def build(
                             size=14,
                             weight=ft.FontWeight.W_600,
                             font_family=FONT_FAMILY,
+                        ),
+                        ft.TextButton(
+                            "Add line",
+                            icon=ft.Icons.ADD,
+                            tooltip="Checker: add a PDF line missed by Items Ordered",
+                            on_click=add_ticket_line_button_click,
                         ),
                         ft.Container(expand=True),
                         muted("Pick order:"),

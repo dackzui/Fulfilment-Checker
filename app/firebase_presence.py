@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,11 +29,27 @@ AUTH_CACHE_FILE = "firebase_auth.json"
 
 HEARTBEAT_SECONDS = 30
 ONLINE_WITHIN_SECONDS = 90
+# Coalesce bursty SSE events so the Monitor UI updates once per change batch.
+_LISTENER_DEBOUNCE_SECONDS = 0.15
 
 _scheduler_stop = threading.Event()
 _scheduler_thread: threading.Thread | None = None
 _scheduler_lock = threading.Lock()
 _auth_lock = threading.Lock()
+
+_presence_tree: dict[str, Any] = {}
+_presence_tree_ready = False
+_presence_tree_lock = threading.Lock()
+_listener_stop = threading.Event()
+_listener_thread: threading.Thread | None = None
+_listener_lock = threading.Lock()
+_listener_callbacks: list[Callable[[], None]] = []
+_listener_debounce_lock = threading.Lock()
+_listener_debounce_timer: threading.Timer | None = None
+_listener_active = False
+_publish_lock = threading.Lock()
+_last_publish_at = 0.0
+_MIN_PUBLISH_GAP_SECONDS = 0.35
 
 
 @dataclass
@@ -54,10 +70,16 @@ class PresenceEntry:
     stats_total: dict[str, int] | None = None
     stats_week: dict[str, int] | None = None
     stats_last_week: dict[str, int] | None = None
+    stats_month: dict[str, int] | None = None
+    stats_custom: dict[str, int] | None = None
     stats_today_lines: dict[str, int] | None = None
     stats_total_lines: dict[str, int] | None = None
     stats_week_lines: dict[str, int] | None = None
     stats_last_week_lines: dict[str, int] | None = None
+    stats_month_lines: dict[str, int] | None = None
+    stats_custom_lines: dict[str, int] | None = None
+    stats_daily_picks: dict[str, dict[str, int]] | None = None
+    stats_daily_lines: dict[str, dict[str, int]] | None = None
 
 
 @dataclass
@@ -69,10 +91,14 @@ class UserFulfilmentRow:
     total: int
     week: int = 0
     last_week: int = 0
+    month: int = 0
+    custom: int = 0
     today_lines: int = 0
     total_lines: int = 0
     week_lines: int = 0
     last_week_lines: int = 0
+    month_lines: int = 0
+    custom_lines: int = 0
     online: bool = False
     devices: list[str] | None = None
 
@@ -508,9 +534,23 @@ def publish_heartbeat(
     username: str | None,
     role: str | None,
     online: bool = True,
+    force: bool = False,
 ) -> None:
     if not is_configured():
         return
+
+    # Avoid stampedes when the scheduler fires near another publish.
+    # force=True (completed pick) always sends so the Monitor sees new stats.
+    global _last_publish_at
+    with _publish_lock:
+        now_mono = time.monotonic()
+        if (
+            online
+            and not force
+            and (now_mono - _last_publish_at) < _MIN_PUBLISH_GAP_SECONDS
+        ):
+            return
+        _last_publish_at = now_mono
 
     token = _ensure_id_token()
     uid = _firebase_uid()
@@ -519,7 +559,11 @@ def publish_heartbeat(
     try:
         from app import database
 
-        local_stats = database.local_fulfilment_snapshot()
+        settings = get_dashboard_settings()
+        local_stats = database.local_fulfilment_snapshot(
+            custom_from=str(settings.get("custom_date_from") or "") or None,
+            custom_to=str(settings.get("custom_date_to") or "") or None,
+        )
     except Exception:
         local_stats = {
             "today": {},
@@ -547,7 +591,7 @@ def publish_heartbeat(
         _presence_url(device_id),
         params={"auth": token},
         json=payload,
-        timeout=15,
+        timeout=8,
     )
     if resp.status_code >= 400:
         raise RuntimeError(_firebase_error(resp, "Presence update failed"))
@@ -565,11 +609,42 @@ def publish_heartbeat(
             pass
 
 
+def publish_heartbeat_async(
+    *,
+    username: str | None,
+    role: str | None,
+    online: bool = True,
+    force: bool = False,
+) -> None:
+    """Non-blocking presence publish so scan/UI never waits on Firebase."""
+    if not is_configured():
+        return
+
+    def work() -> None:
+        try:
+            publish_heartbeat(
+                username=username, role=role, online=online, force=force
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=work, name="firebase-heartbeat", daemon=True).start()
+
+
+def notify_stats_changed(
+    *,
+    username: str | None = None,
+    role: str | None = None,
+) -> None:
+    """Push latest fulfilment stats immediately after a completed pick."""
+    publish_heartbeat_async(username=username, role=role, online=True, force=True)
+
+
 def mark_offline(*, username: str | None = None, role: str | None = None) -> None:
     if not is_configured():
         return
     try:
-        publish_heartbeat(username=username, role=role, online=False)
+        publish_heartbeat(username=username, role=role, online=False, force=True)
     except Exception:
         pass
 
@@ -589,9 +664,62 @@ def _as_int_map(raw: Any) -> dict[str, int]:
     return out
 
 
-def fetch_presence() -> list[PresenceEntry]:
+def _as_daily_map(raw: Any) -> dict[str, dict[str, int]]:
+    """Parse ``{YYYY-MM-DD: {picker: count}}`` from heartbeat payloads."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, int]] = {}
+    for day_key, day_val in raw.items():
+        day = str(day_key or "").strip()[:10]
+        if not day:
+            continue
+        nested = _as_int_map(day_val)
+        if nested:
+            out[day] = nested
+    return out
+
+
+def sum_daily_stats_for_range(
+    entries: list[PresenceEntry],
+    start: date,
+    end: date,
+) -> tuple[bool, dict[str, int], dict[str, int]]:
+    """Sum daily heartbeat stats across devices for ``start``..``end``.
+
+    Returns ``(had_daily_data, picks_by_picker, lines_by_picker)``.
+    """
+    if end < start:
+        start, end = end, start
+    picks: dict[str, int] = {}
+    lines: dict[str, int] = {}
+    had_daily = False
+    day = start
+    wanted: list[str] = []
+    while day <= end:
+        wanted.append(day.isoformat())
+        day = day + timedelta(days=1)
+
+    for entry in entries:
+        daily_p = entry.stats_daily_picks or {}
+        daily_l = entry.stats_daily_lines or {}
+        if daily_p or daily_l:
+            had_daily = True
+        for key in wanted:
+            for name, qty in (daily_p.get(key) or {}).items():
+                picks[name] = picks.get(name, 0) + int(qty)
+            for name, qty in (daily_l.get(key) or {}).items():
+                lines[name] = lines.get(name, 0) + int(qty)
+    return had_daily, picks, lines
+
+
+def fetch_presence(*, force_refresh: bool = False) -> list[PresenceEntry]:
+    global _presence_tree_ready
     if not is_configured():
         return []
+
+    with _presence_tree_lock:
+        if _presence_tree_ready and not force_refresh and _listener_active:
+            return _presence_entries_from_raw(dict(_presence_tree))
 
     token = _ensure_id_token()
     resp = requests.get(
@@ -606,6 +734,66 @@ def fetch_presence() -> list[PresenceEntry]:
     if not isinstance(raw, dict):
         return []
 
+    with _presence_tree_lock:
+        _presence_tree.clear()
+        _presence_tree.update(raw)
+        _presence_tree_ready = True
+
+    return _presence_entries_from_raw(raw)
+
+
+def _presence_path_parts(path: str) -> list[str]:
+    cleaned = (path or "/").strip()
+    if cleaned in {"", "/"}:
+        return []
+    return [part for part in cleaned.strip("/").split("/") if part]
+
+
+def _presence_set_at_path(root: dict[str, Any], parts: list[str], data: Any) -> None:
+    if not parts:
+        root.clear()
+        if isinstance(data, dict):
+            root.update(data)
+        return
+    cursor: dict[str, Any] = root
+    for part in parts[:-1]:
+        nxt = cursor.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cursor[part] = nxt
+        cursor = nxt
+    key = parts[-1]
+    if data is None:
+        cursor.pop(key, None)
+    else:
+        cursor[key] = data
+
+
+def _presence_patch_at_path(root: dict[str, Any], parts: list[str], data: Any) -> None:
+    if not isinstance(data, dict):
+        return
+    if not parts:
+        for key, value in data.items():
+            if value is None:
+                root.pop(str(key), None)
+            else:
+                root[str(key)] = value
+        return
+    cursor: dict[str, Any] = root
+    for part in parts:
+        nxt = cursor.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cursor[part] = nxt
+        cursor = nxt
+    for key, value in data.items():
+        if value is None:
+            cursor.pop(str(key), None)
+        else:
+            cursor[str(key)] = value
+
+
+def _presence_entries_from_raw(raw: dict[str, Any]) -> list[PresenceEntry]:
     now = time.time()
     this_id = get_device_id()
     entries: list[PresenceEntry] = []
@@ -620,10 +808,16 @@ def fetch_presence() -> list[PresenceEntry]:
         total_map = _as_int_map(local_stats.get("total"))
         week_map = _as_int_map(local_stats.get("week"))
         last_week_map = _as_int_map(local_stats.get("last_week"))
+        month_map = _as_int_map(local_stats.get("month"))
+        custom_map = _as_int_map(local_stats.get("custom"))
         today_lines_map = _as_int_map(local_stats.get("today_lines"))
         total_lines_map = _as_int_map(local_stats.get("total_lines"))
         week_lines_map = _as_int_map(local_stats.get("week_lines"))
         last_week_lines_map = _as_int_map(local_stats.get("last_week_lines"))
+        month_lines_map = _as_int_map(local_stats.get("month_lines"))
+        custom_lines_map = _as_int_map(local_stats.get("custom_lines"))
+        daily_picks_map = _as_daily_map(local_stats.get("daily_picks"))
+        daily_lines_map = _as_daily_map(local_stats.get("daily_lines"))
         try:
             today_sum = int(local_stats.get("today_sum") or sum(today_map.values()))
         except (TypeError, ValueError):
@@ -654,10 +848,16 @@ def fetch_presence() -> list[PresenceEntry]:
                 stats_total=total_map,
                 stats_week=week_map,
                 stats_last_week=last_week_map,
+                stats_month=month_map,
+                stats_custom=custom_map,
                 stats_today_lines=today_lines_map,
                 stats_total_lines=total_lines_map,
                 stats_week_lines=week_lines_map,
                 stats_last_week_lines=last_week_lines_map,
+                stats_month_lines=month_lines_map,
+                stats_custom_lines=custom_lines_map,
+                stats_daily_picks=daily_picks_map,
+                stats_daily_lines=daily_lines_map,
             )
         )
 
@@ -671,16 +871,190 @@ def fetch_presence() -> list[PresenceEntry]:
     return entries
 
 
+def presence_listener_active() -> bool:
+    return bool(_listener_active)
+
+
+def _notify_presence_listeners() -> None:
+    callbacks: list[Callable[[], None]]
+    with _listener_lock:
+        callbacks = list(_listener_callbacks)
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception:
+            pass
+
+
+def _schedule_presence_listener_notify() -> None:
+    global _listener_debounce_timer
+
+    def fire() -> None:
+        global _listener_debounce_timer
+        with _listener_debounce_lock:
+            _listener_debounce_timer = None
+        _notify_presence_listeners()
+
+    with _listener_debounce_lock:
+        if _listener_debounce_timer is not None:
+            _listener_debounce_timer.cancel()
+        _listener_debounce_timer = threading.Timer(
+            _LISTENER_DEBOUNCE_SECONDS, fire
+        )
+        _listener_debounce_timer.daemon = True
+        _listener_debounce_timer.start()
+
+
+def _apply_presence_sse_event(event_name: str, payload: dict[str, Any]) -> bool:
+    global _presence_tree_ready
+    path = str(payload.get("path") or "/")
+    data = payload.get("data")
+    parts = _presence_path_parts(path)
+    with _presence_tree_lock:
+        if event_name == "put":
+            _presence_set_at_path(_presence_tree, parts, data)
+            _presence_tree_ready = True
+            return True
+        if event_name == "patch":
+            _presence_patch_at_path(_presence_tree, parts, data)
+            _presence_tree_ready = True
+            return True
+    return False
+
+
+def _presence_sse_loop() -> None:
+    global _listener_active
+    backoff = 1.0
+    while not _listener_stop.is_set():
+        if not is_configured():
+            _listener_active = False
+            _listener_stop.wait(3)
+            continue
+        try:
+            token = _ensure_id_token()
+            with requests.get(
+                _presence_url(),
+                params={"auth": token},
+                headers={"Accept": "text/event-stream"},
+                stream=True,
+                # Connect quickly; keep-alives arrive ~every 30s so allow idle reads.
+                timeout=(15, 90),
+            ) as resp:
+                if resp.status_code >= 400:
+                    raise RuntimeError(
+                        _firebase_error(resp, "Presence listener failed")
+                    )
+                _listener_active = True
+                backoff = 1.0
+                event_name = "message"
+                data_lines: list[str] = []
+
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if _listener_stop.is_set():
+                        break
+                    if raw_line is None:
+                        continue
+                    line = raw_line.rstrip("\r")
+                    if not line:
+                        if data_lines:
+                            payload_text = "\n".join(data_lines)
+                            data_lines = []
+                            name = (event_name or "message").strip().lower()
+                            event_name = "message"
+                            if name in {"put", "patch"}:
+                                try:
+                                    payload = json.loads(payload_text)
+                                except json.JSONDecodeError:
+                                    continue
+                                if isinstance(payload, dict) and _apply_presence_sse_event(
+                                    name, payload
+                                ):
+                                    _schedule_presence_listener_notify()
+                            elif name == "auth_revoked":
+                                raise RuntimeError("Firebase auth revoked")
+                            elif name == "cancel":
+                                raise RuntimeError("Firebase stream cancelled")
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line[6:].strip() or "message"
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+        except Exception:
+            _listener_active = False
+            if _listener_stop.is_set():
+                break
+            _listener_stop.wait(backoff)
+            backoff = min(30.0, backoff * 1.7)
+        finally:
+            if _listener_stop.is_set():
+                _listener_active = False
+
+
+def start_presence_listener(on_change: Callable[[], None]) -> None:
+    """Subscribe to Firebase presence SSE. Callbacks run on a background thread."""
+    if not callable(on_change):
+        return
+    global _listener_thread
+    with _listener_lock:
+        if on_change not in _listener_callbacks:
+            _listener_callbacks.append(on_change)
+        if _listener_thread and _listener_thread.is_alive():
+            return
+        _listener_stop.clear()
+
+        def loop() -> None:
+            _presence_sse_loop()
+
+        _listener_thread = threading.Thread(
+            target=loop,
+            name="firebase-presence-sse",
+            daemon=True,
+        )
+        _listener_thread.start()
+
+
+def stop_presence_listener(on_change: Callable[[], None] | None = None) -> None:
+    """Unsubscribe a callback; stop the SSE thread when no listeners remain."""
+    global _listener_thread, _listener_active
+    with _listener_lock:
+        if on_change is not None:
+            _listener_callbacks[:] = [
+                cb for cb in _listener_callbacks if cb is not on_change
+            ]
+        else:
+            _listener_callbacks.clear()
+        remaining = len(_listener_callbacks)
+    if remaining:
+        return
+    _listener_stop.set()
+    with _listener_debounce_lock:
+        global _listener_debounce_timer
+        if _listener_debounce_timer is not None:
+            _listener_debounce_timer.cancel()
+            _listener_debounce_timer = None
+    _listener_active = False
+    thread = _listener_thread
+    _listener_thread = None
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=1.5)
+
+
 def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRow]:
     """Sum completed fulfilments per picker across all reporting devices."""
     today: dict[str, int] = {}
     total: dict[str, int] = {}
     week: dict[str, int] = {}
     last_week: dict[str, int] = {}
+    month: dict[str, int] = {}
+    custom: dict[str, int] = {}
     today_lines: dict[str, int] = {}
     total_lines: dict[str, int] = {}
     week_lines: dict[str, int] = {}
     last_week_lines: dict[str, int] = {}
+    month_lines: dict[str, int] = {}
+    custom_lines: dict[str, int] = {}
 
     def _add(target: dict[str, int], source: dict[str, int] | None) -> None:
         for name, count in (source or {}).items():
@@ -691,10 +1065,14 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
         _add(total, entry.stats_total)
         _add(week, entry.stats_week)
         _add(last_week, entry.stats_last_week)
+        _add(month, entry.stats_month)
+        _add(custom, entry.stats_custom)
         _add(today_lines, entry.stats_today_lines)
         _add(total_lines, entry.stats_total_lines)
         _add(week_lines, entry.stats_week_lines)
         _add(last_week_lines, entry.stats_last_week_lines)
+        _add(month_lines, entry.stats_month_lines)
+        _add(custom_lines, entry.stats_custom_lines)
 
     # Mark a picker "online" if any online tablet recently reported that picker
     # in today's stats (they are actively being fulfilled on an open device).
@@ -711,10 +1089,14 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
         | set(total)
         | set(week)
         | set(last_week)
+        | set(month)
+        | set(custom)
         | set(today_lines)
         | set(total_lines)
         | set(week_lines)
-        | set(last_week_lines),
+        | set(last_week_lines)
+        | set(month_lines)
+        | set(custom_lines),
         key=lambda n: (-today.get(n, 0), n.lower()),
     )
     rows: list[UserFulfilmentRow] = []
@@ -726,10 +1108,14 @@ def aggregate_fulfilments(entries: list[PresenceEntry]) -> list[UserFulfilmentRo
                 total=int(total.get(name, 0)),
                 week=int(week.get(name, 0)),
                 last_week=int(last_week.get(name, 0)),
+                month=int(month.get(name, 0)),
+                custom=int(custom.get(name, 0)),
                 today_lines=int(today_lines.get(name, 0)),
                 total_lines=int(total_lines.get(name, 0)),
                 week_lines=int(week_lines.get(name, 0)),
                 last_week_lines=int(last_week_lines.get(name, 0)),
+                month_lines=int(month_lines.get(name, 0)),
+                custom_lines=int(custom_lines.get(name, 0)),
                 online=name.casefold() in online_pickers,
                 devices=[],
             )
@@ -741,14 +1127,82 @@ def _dashboard_settings_url() -> str:
     return f"{resolve_config()['database_url']}/dashboard_settings.json"
 
 
+def normalize_week_filter(value: Any) -> str:
+    """Map dropdown key/label to a period key.
+
+    Supported: ``today``, ``this``, ``last``, ``month``, ``custom``.
+    Flet may return option text (e.g. ``Last week``) instead of the key.
+    """
+    raw = str(value or "this").strip().lower()
+    if raw in {"today", "day"} or "today" in raw:
+        return "today"
+    if raw in {"month", "this_month", "this-month", "this month", "whole month"}:
+        return "month"
+    if "month" in raw:
+        return "month"
+    if raw in {"custom", "custom date", "custom dates", "date range", "range"}:
+        return "custom"
+    if "custom" in raw:
+        return "custom"
+    if raw in {"last", "last_week", "last-week", "previous", "previous week"}:
+        return "last"
+    if "last" in raw:
+        return "last"
+    return "this"
+
+
+def period_label(which: str) -> str:
+    """Human label for a period key."""
+    key = normalize_week_filter(which)
+    return {
+        "today": "Today",
+        "this": "This week",
+        "last": "Last week",
+        "month": "This month",
+        "custom": "Custom",
+    }.get(key, "This week")
+
+
+def _normalize_iso_date(value: Any) -> str:
+    """Return YYYY-MM-DD or empty string."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return date.fromisoformat(raw[:10]).isoformat()
+    except ValueError:
+        pass
+    # DD/MM/YYYY
+    parts = raw.replace("-", "/").split("/")
+    if len(parts) == 3:
+        try:
+            day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+            if year < 100:
+                year += 2000
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return ""
+    return ""
+
+
 def get_dashboard_settings() -> dict[str, Any]:
-    """Load shared dashboard settings (week filter, prize message, etc.)."""
+    """Load shared dashboard settings (period filter, prize message, etc.)."""
     local = _load_json(_app_config_path())
-    week = str(local.get("dashboard_week_filter") or "this").strip().lower()
+    week = normalize_week_filter(local.get("dashboard_week_filter") or "this")
     prize = str(local.get("dashboard_prize_message") or "").strip()
+    custom_from = _normalize_iso_date(local.get("dashboard_custom_date_from"))
+    custom_to = _normalize_iso_date(local.get("dashboard_custom_date_to"))
     settings = {
-        "week_filter": "last" if week == "last" else "this",
+        "week_filter": week,
         "prize_message": prize,
+        "custom_date_from": custom_from,
+        "custom_date_to": custom_to,
         "updated_by": str(local.get("dashboard_settings_updated_by") or "").strip() or None,
     }
     if not is_configured():
@@ -765,9 +1219,16 @@ def get_dashboard_settings() -> dict[str, Any]:
         raw = resp.json() or {}
         if not isinstance(raw, dict):
             return settings
-        remote_week = str(raw.get("week_filter") or settings["week_filter"]).strip().lower()
-        settings["week_filter"] = "last" if remote_week == "last" else "this"
+        settings["week_filter"] = normalize_week_filter(
+            raw.get("week_filter") or settings["week_filter"]
+        )
         settings["prize_message"] = str(raw.get("prize_message") or "").strip()
+        remote_from = _normalize_iso_date(raw.get("custom_date_from"))
+        remote_to = _normalize_iso_date(raw.get("custom_date_to"))
+        if remote_from:
+            settings["custom_date_from"] = remote_from
+        if remote_to:
+            settings["custom_date_to"] = remote_to
         settings["updated_by"] = (
             str(raw.get("updated_by") or "").strip() or settings["updated_by"]
         )
@@ -780,23 +1241,29 @@ def save_dashboard_settings(
     *,
     week_filter: str | None = None,
     prize_message: str | None = None,
+    custom_date_from: str | None = None,
+    custom_date_to: str | None = None,
     updated_by: str | None = None,
 ) -> dict[str, Any]:
     """Merge and persist dashboard settings locally and to Firebase when configured."""
     current = get_dashboard_settings()
     if week_filter is not None:
-        current["week_filter"] = (
-            "last" if str(week_filter).strip().lower() == "last" else "this"
-        )
+        current["week_filter"] = normalize_week_filter(week_filter)
     if prize_message is not None:
         # Optional — empty string clears the message.
         current["prize_message"] = str(prize_message).strip()[:280]
+    if custom_date_from is not None:
+        current["custom_date_from"] = _normalize_iso_date(custom_date_from)
+    if custom_date_to is not None:
+        current["custom_date_to"] = _normalize_iso_date(custom_date_to)
     if updated_by is not None:
         current["updated_by"] = (updated_by or "").strip() or None
 
     local = _load_json(_app_config_path())
     local["dashboard_week_filter"] = current["week_filter"]
     local["dashboard_prize_message"] = current["prize_message"]
+    local["dashboard_custom_date_from"] = current.get("custom_date_from") or ""
+    local["dashboard_custom_date_to"] = current.get("custom_date_to") or ""
     local["dashboard_settings_updated_by"] = current.get("updated_by") or ""
     _save_json(_app_config_path(), local)
 
@@ -807,6 +1274,8 @@ def save_dashboard_settings(
     payload = {
         "week_filter": current["week_filter"],
         "prize_message": current["prize_message"],
+        "custom_date_from": current.get("custom_date_from") or "",
+        "custom_date_to": current.get("custom_date_to") or "",
         "updated_by": current.get("updated_by"),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "firebase_uid": _firebase_uid(),
@@ -842,31 +1311,48 @@ def set_prize_message(message: str, *, updated_by: str | None = None) -> str:
     return str(settings.get("prize_message") or "")
 
 
-def dashboard_snapshot() -> dict[str, Any]:
+def dashboard_snapshot(*, force_refresh: bool = False) -> dict[str, Any]:
     """Presence + fulfilment rows for the Home dashboard."""
     from app import database
 
     settings = get_dashboard_settings()
-    week_filter = str(settings.get("week_filter") or "this")
+    week_filter = normalize_week_filter(settings.get("week_filter") or "this")
     prize_message = str(settings.get("prize_message") or "").strip()
-    week_start, week_end = database.week_date_bounds(week_filter)
+    custom_from = str(settings.get("custom_date_from") or "")
+    custom_to = str(settings.get("custom_date_to") or "")
+    week_start, week_end = database.period_date_bounds(
+        week_filter,
+        custom_from=custom_from or None,
+        custom_to=custom_to or None,
+    )
     if not is_configured():
-        local = database.local_fulfilment_snapshot()
+        local = database.local_fulfilment_snapshot(
+            custom_from=custom_from or None,
+            custom_to=custom_to or None,
+        )
         today = local.get("today") or {}
         total = local.get("total") or {}
         week = local.get("week") or {}
         last_week = local.get("last_week") or {}
+        month = local.get("month") or {}
+        custom = local.get("custom") or {}
         today_lines = local.get("today_lines") or {}
         total_lines = local.get("total_lines") or {}
         week_lines = local.get("week_lines") or {}
         last_week_lines = local.get("last_week_lines") or {}
+        month_lines = local.get("month_lines") or {}
+        custom_lines = local.get("custom_lines") or {}
         names = sorted(
             set(today)
             | set(total)
             | set(week)
             | set(last_week)
+            | set(month)
+            | set(custom)
             | set(today_lines)
-            | set(week_lines),
+            | set(week_lines)
+            | set(month_lines)
+            | set(custom_lines),
             key=lambda n: (-int(today.get(n, 0)), n.lower()),
         )
         rows = [
@@ -876,10 +1362,14 @@ def dashboard_snapshot() -> dict[str, Any]:
                 total=int(total.get(name, 0)),
                 week=int(week.get(name, 0)),
                 last_week=int(last_week.get(name, 0)),
+                month=int(month.get(name, 0)),
+                custom=int(custom.get(name, 0)),
                 today_lines=int(today_lines.get(name, 0)),
                 total_lines=int(total_lines.get(name, 0)),
                 week_lines=int(week_lines.get(name, 0)),
                 last_week_lines=int(last_week_lines.get(name, 0)),
+                month_lines=int(month_lines.get(name, 0)),
+                custom_lines=int(custom_lines.get(name, 0)),
                 online=False,
                 devices=[],
             )
@@ -895,11 +1385,13 @@ def dashboard_snapshot() -> dict[str, Any]:
             "week_filter": week_filter,
             "week_start": week_start.isoformat(),
             "week_end": week_end.isoformat(),
+            "custom_date_from": custom_from,
+            "custom_date_to": custom_to,
             "prize_message": prize_message,
             "source": "local",
         }
 
-    presence = fetch_presence()
+    presence = fetch_presence(force_refresh=force_refresh)
     fulfilments = aggregate_fulfilments(presence)
     online = [e for e in presence if e.online]
     return {
@@ -912,8 +1404,10 @@ def dashboard_snapshot() -> dict[str, Any]:
         "week_filter": week_filter,
         "week_start": week_start.isoformat(),
         "week_end": week_end.isoformat(),
+        "custom_date_from": custom_from,
+        "custom_date_to": custom_to,
         "prize_message": prize_message,
-        "source": "firebase",
+        "source": "firebase-live" if presence_listener_active() else "firebase",
     }
 
 def presence_status_text() -> str:

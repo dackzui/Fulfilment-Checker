@@ -471,6 +471,21 @@ def can_manage_monitor_settings(role: str | None) -> bool:
     return role == ROLE_SUPER_ADMIN
 
 
+def can_add_missing_ticket_line(role: str | None) -> bool:
+    """Admins / Super Admins (checkers) may add PDF lines missed by the parser."""
+    return role in (ROLE_ADMIN, ROLE_SUPER_ADMIN)
+
+
+def authenticate_ticket_checker(
+    username: str, password: str
+) -> AdminAccount | None:
+    """Authenticate a checker for one-off ticket line adds without changing app session."""
+    account = authenticate(username, password)
+    if account and can_add_missing_ticket_line(account.role):
+        return account
+    return None
+
+
 def list_admin_accounts(actor_username: str) -> list[AdminAccount]:
     if not is_super_admin(actor_username):
         raise PermissionError("Only Super Admin users can manage accounts.")

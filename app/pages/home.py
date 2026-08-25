@@ -26,22 +26,23 @@ def _format_iso_range(start_iso: str, end_iso: str) -> str:
         return ""
 
 
-def _format_picks_lines(picks: int, lines: int) -> str:
+def _format_lines_picks(picks: int, lines: int) -> str:
+    """Lines first — used by the Home leaderboard (ranked by lines)."""
     pick_bit = f"{picks} pick" if picks == 1 else f"{picks} picks"
     line_bit = f"{lines} line" if lines == 1 else f"{lines} lines"
-    return f"{pick_bit} · {line_bit}"
+    return f"{line_bit} · {pick_bit}"
 
 
 def _week_bar_chart(rows: list[tuple[str, int, int]]) -> ft.Control:
-    """Horizontal bar chart — pickups and lines for the selected week."""
+    """Horizontal bar chart — ranked by ticket lines for the selected period."""
     if not rows:
         return muted("No weekly fulfilments yet for this period.")
 
-    max_count = max(picks for _, picks, _ in rows) or 1
+    max_count = max(lines for _, _, lines in rows) or 1
     bars: list[ft.Control] = []
     for index, (name, picks, lines) in enumerate(rows):
         is_top = index == 0
-        width_frac = max(0.06, picks / max_count)
+        width_frac = max(0.06, lines / max_count)
         color = "#F9A825" if is_top else _BAR_COLORS[index % len(_BAR_COLORS)]
         label_controls: list[ft.Control] = []
         if is_top:
@@ -58,7 +59,7 @@ def _week_bar_chart(rows: list[tuple[str, int, int]]) -> ft.Control:
         )
         label_controls.append(
             ft.Text(
-                _format_picks_lines(picks, lines),
+                _format_lines_picks(picks, lines),
                 size=12,
                 weight=ft.FontWeight.W_600,
                 font_family=FONT_FAMILY,
@@ -144,19 +145,22 @@ def build(
     week_filter_state = {"value": "this"}
 
     week_filter_dropdown = ft.Dropdown(
-        label="Week filter",
+        label="Period",
         value="this",
         width=220,
         options=[
+            ft.DropdownOption(key="today", text="Today"),
             ft.DropdownOption(key="this", text="This week"),
             ft.DropdownOption(key="last", text="Last week"),
+            ft.DropdownOption(key="month", text="This month"),
+            ft.DropdownOption(key="custom", text="Custom dates"),
         ],
         visible=is_super_admin,
     )
     week_filter_hint = muted(
-        "Super Admin can switch This week / Last week for everyone."
+        "Super Admin can switch Today / week / month / custom for everyone."
         if is_super_admin
-        else "Week filter is controlled by Super Admin."
+        else "Period filter is controlled by Super Admin."
     )
 
     quick_actions = ft.Row(
@@ -356,17 +360,50 @@ def build(
         prize_message: str = "",
     ) -> None:
         week_chart_host.controls.clear()
+        which = firebase_presence.normalize_week_filter(which)
         ranked: list[tuple[str, int, int]] = []
         for row in rows:
-            if which == "last":
+            if which == "today":
+                picks = int(row.today)
+                lines = int(row.today_lines)
+            elif which == "last":
                 picks = int(row.last_week)
                 lines = int(row.last_week_lines)
+            elif which == "month":
+                picks = int(row.month)
+                lines = int(row.month_lines)
+            elif which == "custom":
+                picks = int(row.custom)
+                lines = int(row.custom_lines)
             else:
                 picks = int(row.week)
                 lines = int(row.week_lines)
             if picks > 0 or lines > 0:
                 ranked.append((row.picker_name, picks, lines))
-        ranked.sort(key=lambda item: (-item[1], -item[2], item[0].lower()))
+        # Older tablets may not publish month/custom — stitch week buckets.
+        if not ranked and which in {"month", "custom", "today"}:
+            start, end = database.period_date_bounds(which)
+            week_start, week_end = database.week_date_bounds("this")
+            last_start, last_end = database.week_date_bounds("last")
+            today = date.today()
+            use_week = week_start <= end and week_end >= start
+            use_last = last_start <= end and last_end >= start
+            use_today_only = (start <= today <= end) and not use_week
+            for row in rows:
+                picks = 0
+                lines = 0
+                if use_week:
+                    picks += int(row.week)
+                    lines += int(row.week_lines)
+                elif use_today_only:
+                    picks += int(row.today)
+                    lines += int(row.today_lines)
+                if use_last:
+                    picks += int(row.last_week)
+                    lines += int(row.last_week_lines)
+                if picks > 0 or lines > 0:
+                    ranked.append((row.picker_name, picks, lines))
+        ranked.sort(key=lambda item: (-item[2], -item[1], item[0].lower()))
         top_name = ranked[0][0] if ranked else None
         prize = (prize_message or "").strip()
         if prize:
@@ -403,8 +440,8 @@ def build(
             top_name, top_picks, top_lines = ranked[0]
             week_chart_host.controls.append(
                 muted(
-                    f"👑 Most this period: {top_name} "
-                    f"({_format_picks_lines(top_picks, top_lines)})"
+                    f"👑 Most lines this period: {top_name} "
+                    f"({_format_lines_picks(top_picks, top_lines)})"
                 )
             )
         week_chart_host.controls.append(_week_bar_chart(ranked[:12]))
@@ -415,7 +452,9 @@ def build(
         render_online(list(snap.get("presence") or []))
         fulfilments = list(snap.get("fulfilments") or [])
         render_fulfilments(fulfilments)
-        which = str(snap.get("week_filter") or week_filter_state["value"] or "this")
+        which = firebase_presence.normalize_week_filter(
+            snap.get("week_filter") or week_filter_state["value"] or "this"
+        )
         week_filter_state["value"] = which
         if week_filter_dropdown.value != which:
             week_filter_dropdown.value = which
@@ -423,7 +462,7 @@ def build(
             str(snap.get("week_start") or ""),
             str(snap.get("week_end") or ""),
         )
-        label = "Last week" if which == "last" else "This week"
+        label = firebase_presence.period_label(which)
         week_range_label.value = f"{label}: {range_text}" if range_text else label
         render_week_chart(
             fulfilments,
@@ -475,9 +514,10 @@ def build(
             week_filter_dropdown.value = week_filter_state["value"]
             page.update()
             return
-        chosen = (e.control.value or "this").strip().lower()
-        if chosen not in ("this", "last"):
-            chosen = "this"
+        chosen = firebase_presence.normalize_week_filter(
+            getattr(e.control, "value", None) or week_filter_dropdown.value or "this"
+        )
+        week_filter_dropdown.value = chosen
 
         def work():
             try:
@@ -503,7 +543,7 @@ def build(
 
         page.run_thread(work)
 
-    week_filter_dropdown.on_change = on_week_filter_change
+    week_filter_dropdown.on_select = on_week_filter_change
 
     refresh_token = time.time()
     page._home_dashboard_token = refresh_token
@@ -637,16 +677,15 @@ def build(
                 fulfilment_list,
                 ft.Divider(height=12, color=ft.Colors.TRANSPARENT),
                 ft.Text(
-                    "Most pickups this week",
+                    "Most lines this week",
                     size=15,
                     weight=ft.FontWeight.W_600,
                     font_family=FONT_FAMILY,
                 ),
                 muted(
-                    "Bar graph of completed picks and ticket lines by picker (Mon–Sun). "
+                    "Bar graph ranked by ticket lines (then picks) for the selected period. "
                     "Only Super Admin can change the week filter."
-                ),
-                week_filter_row,
+                ),                week_filter_row,
                 week_filter_hint,
                 week_chart_host,
                 ft.Divider(height=16, color=ft.Colors.TRANSPARENT),

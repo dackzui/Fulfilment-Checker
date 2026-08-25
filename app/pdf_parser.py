@@ -20,14 +20,15 @@ _QTY_RE = r"[\d,]+"
 # Some tickets label the bin column row as PICK; others as BAY.
 _ITEM_PREFIX = r"(?:PICK|BAY)"
 JOINED_ITEM_RE = re.compile(
-    # Layout: PICK|BAY[bay_prefix] <Part #> <Description> EA <Ordered> <Committed> <B/O>
+    # Layout: PICK|BAY[bay_prefix] <Part #> <Description> [EA] <Ordered> <Committed> <B/O>
     # Bay may start glued to PICK (PICK13) and finish on the next line (09 -> 1309).
+    # Some PDF layouts drop the "EA" unit token — treat it as optional.
     rf"^{_ITEM_PREFIX}(?P<bay_prefix>\d*)\s+(?P<part_no>[A-Z0-9\-/]+)\s+(?P<description>.+?)\s+"
-    rf"EA\s+(?P<qty_ordered>{_QTY_RE})\s+(?P<qty>{_QTY_RE})\s+(?P<qty_bo>{_QTY_RE})\s*$",
+    rf"(?:EA\s+)?(?P<qty_ordered>{_QTY_RE})\s+(?P<qty>{_QTY_RE})\s+(?P<qty_bo>{_QTY_RE})\s*$",
     re.IGNORECASE,
 )
 ITEM_LINE_RE = re.compile(
-    rf"^{_ITEM_PREFIX}(?P<bay_prefix>\d*)\s+(\S+)\s+(.+?)\s+EA\s+{_QTY_RE}\s+({_QTY_RE})\s+{_QTY_RE}\s*$",
+    rf"^{_ITEM_PREFIX}(?P<bay_prefix>\d*)\s+(\S+)\s+(.+?)\s+(?:EA\s+)?{_QTY_RE}\s+({_QTY_RE})\s+{_QTY_RE}\s*$",
     re.IGNORECASE,
 )
 # Leading bin fragment on a follow-on line, optionally with description text after it.
@@ -217,7 +218,7 @@ def _looks_like_item_line(line: str) -> bool:
     return bool(
         re.match(rf"^{_ITEM_PREFIX}\d+\s+\S+", stripped, re.IGNORECASE)
         and re.search(
-            rf"\s+EA\s+{_QTY_RE}\s+{_QTY_RE}\s+{_QTY_RE}\s*$",
+            rf"\s+(?:EA\s+)?{_QTY_RE}\s+{_QTY_RE}\s+{_QTY_RE}\s*$",
             stripped,
             re.IGNORECASE,
         )
