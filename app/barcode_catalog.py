@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from openpyxl import load_workbook
 
 from app.paths import get_data_dir
 from app.pdf_parser import normalize_part
+from app.sqlite_util import DB_LOCK, connect as sqlite_connect, retry_locked
 
 
 def _data_dir() -> Path:
@@ -92,11 +94,16 @@ def _save_config_path() -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    _data_dir().mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(_db_path(), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return sqlite_connect(_db_path(), timeout=60.0)
+
+
+@contextmanager
+def _db():
+    """Share scanner.db lock with database.py (avoids Android lock errors)."""
+    with DB_LOCK:
+        with _connect() as conn:
+            _ensure_tables(conn)
+            yield conn
 
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:
@@ -309,8 +316,7 @@ def load_from_excel(path: Path | None = None) -> int:
 
     workbook.close()
 
-    with _connect() as conn:
-        _ensure_tables(conn)
+    with _db() as conn:
         conn.execute("DELETE FROM barcode_master")
         conn.executemany(
             "INSERT INTO barcode_master (barcode, part_no, description, set_qty, box_qty, pallet_qty) VALUES (?, ?, ?, ?, ?, ?)",
@@ -398,8 +404,7 @@ def ensure_loaded() -> int:
         )
 
     file_mtime = str(path.stat().st_mtime)
-    with _connect() as conn:
-        _ensure_tables(conn)
+    with _db() as conn:
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(barcode_master)").fetchall()
         }
@@ -440,8 +445,7 @@ def ensure_loaded() -> int:
 
 
 def catalog_count() -> int:
-    with _connect() as conn:
-        _ensure_tables(conn)
+    with _db() as conn:
         row = conn.execute("SELECT COUNT(*) AS count FROM barcode_master").fetchone()
         return int(row["count"]) if row else 0
 
@@ -573,8 +577,7 @@ def lookup_part_no(part_no: str) -> dict[str, str] | None:
     if not target:
         return None
 
-    with _connect() as conn:
-        _ensure_tables(conn)
+    with _db() as conn:
         row = conn.execute(
             """
             SELECT part_no, description
@@ -598,8 +601,7 @@ def lookup_barcode(barcode: str) -> dict[str, str] | None:
     if not code:
         return None
 
-    with _connect() as conn:
-        _ensure_tables(conn)
+    with _db() as conn:
         row = conn.execute(
             "SELECT barcode, part_no, description, set_qty, box_qty, pallet_qty FROM barcode_master WHERE barcode = ?",
             (code,),

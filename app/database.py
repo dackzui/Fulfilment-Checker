@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from app import barcode_catalog
 from app.components import capitalize_person_name
 from app.paths import get_data_dir
 from app.pdf_parser import PickingTicket, ticket_from_dict, ticket_to_dict
+from app.sqlite_util import DB_LOCK, connect as sqlite_connect, retry_locked
 from app.verification import compute_verification
+
+# Schema/backfill only needs to run once per process after startup.
+_schema_ready = False
 
 
 def _db_path() -> Path:
@@ -20,15 +25,24 @@ def _db_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
-    db_path = _db_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return sqlite_connect(_db_path(), timeout=60.0)
+
+
+@contextmanager
+def _db() -> Iterator[sqlite3.Connection]:
+    """Open scanner.db under the shared lock (safe with Firebase heartbeats)."""
+    with DB_LOCK:
+        with _connect() as conn:
+            _migrate(conn)
+            yield conn
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply schema upgrades. Heavy backfills run only once per process."""
+    global _schema_ready
+    if _schema_ready:
+        return
+
     session_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(scan_sessions)").fetchall()
     }
@@ -69,11 +83,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 "INSERT OR IGNORE INTO picker_names (name, created_at) VALUES (?, ?)",
                 (name, now),
             )
+    _schema_ready = True
 
 
 def list_picker_names() -> list[str]:
-    with _connect() as conn:
-        _migrate(conn)
+    with _db() as conn:
         rows = conn.execute(
             "SELECT name FROM picker_names ORDER BY name COLLATE NOCASE"
         ).fetchall()
@@ -84,8 +98,7 @@ def remember_picker_name(name: str) -> None:
     picker = capitalize_person_name(name).strip()
     if not picker:
         return
-    with _connect() as conn:
-        _migrate(conn)
+    with _db() as conn:
         _remember_picker_name(conn, picker)
 
 
@@ -104,47 +117,48 @@ def delete_picker_name(name: str) -> None:
     picker = capitalize_person_name(name).strip()
     if not picker:
         return
-    with _connect() as conn:
-        _migrate(conn)
+    with _db() as conn:
         conn.execute("DELETE FROM picker_names WHERE name = ? COLLATE NOCASE", (picker,))
 
 
 def init_db() -> None:
-    with _connect() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS scan_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                picker_name TEXT NOT NULL,
-                checker_name TEXT NOT NULL,
-                check_date TEXT NOT NULL,
-                check_time TEXT,
-                sales_order_no TEXT NOT NULL,
-                no_of_boxes TEXT,
-                picking_correct INTEGER NOT NULL DEFAULT 0,
-                item_correct INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'completed',
-                ticket_json TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT
-            );
+    def setup() -> None:
+        with _db() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS scan_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    picker_name TEXT NOT NULL,
+                    checker_name TEXT NOT NULL,
+                    check_date TEXT NOT NULL,
+                    check_time TEXT,
+                    sales_order_no TEXT NOT NULL,
+                    no_of_boxes TEXT,
+                    picking_correct INTEGER NOT NULL DEFAULT 0,
+                    item_correct INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    ticket_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT
+                );
 
-            CREATE TABLE IF NOT EXISTS scan_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id INTEGER NOT NULL,
-                item_scanned TEXT NOT NULL,
-                part_no TEXT,
-                description TEXT,
-                qty INTEGER NOT NULL DEFAULT 1,
-                match_status TEXT,
-                set_qty INTEGER,
-                box_qty INTEGER,
-                pallet_qty INTEGER,
-                FOREIGN KEY (session_id) REFERENCES scan_sessions(id)
-            );
-            """
-        )
-        _migrate(conn)
+                CREATE TABLE IF NOT EXISTS scan_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    item_scanned TEXT NOT NULL,
+                    part_no TEXT,
+                    description TEXT,
+                    qty INTEGER NOT NULL DEFAULT 1,
+                    match_status TEXT,
+                    set_qty INTEGER,
+                    box_qty INTEGER,
+                    pallet_qty INTEGER,
+                    FOREIGN KEY (session_id) REFERENCES scan_sessions(id)
+                );
+                """
+            )
+
+    retry_locked(setup)
     barcode_catalog.ensure_loaded()
 
 
@@ -180,79 +194,82 @@ def save_session(
     picker_name = capitalize_person_name(picker_name)
     checker_name = capitalize_person_name(checker_name)
 
-    with _connect() as conn:
-        _migrate(conn)
-        was_completed = False
-        if session_id:
-            prev = conn.execute(
-                "SELECT status FROM scan_sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if prev is not None:
-                was_completed = str(prev["status"] or "") == "completed"
-            conn.execute(
-                """
-                UPDATE scan_sessions SET
-                    picker_name = ?, checker_name = ?, check_date = ?,
-                    check_time = ?, sales_order_no = ?, no_of_boxes = ?,
-                    picking_correct = ?, item_correct = ?, status = ?,
-                    ticket_json = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    picker_name.strip(),
-                    checker_name.strip(),
-                    check_date,
-                    (check_time or "").strip(),
-                    sales_order_no.strip(),
-                    no_of_boxes.strip(),
-                    int(picking_correct),
-                    int(item_correct),
-                    status,
-                    ticket_json,
-                    now,
-                    session_id,
-                ),
-            )
-            conn.execute("DELETE FROM scan_items WHERE session_id = ?", (session_id,))
-            sid = session_id
-        else:
-            cursor = conn.execute(
-                """
-                INSERT INTO scan_sessions (
-                    picker_name, checker_name, check_date, check_time, sales_order_no,
-                    no_of_boxes, picking_correct, item_correct, status,
-                    ticket_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    picker_name.strip(),
-                    checker_name.strip(),
-                    check_date,
-                    (check_time or "").strip(),
-                    sales_order_no.strip(),
-                    no_of_boxes.strip(),
-                    int(picking_correct),
-                    int(item_correct),
-                    status,
-                    ticket_json,
-                    now,
-                    now,
-                ),
-            )
-            sid = cursor.lastrowid
+    def write() -> tuple[int, bool]:
+        with _db() as conn:
+            was_completed = False
+            if session_id:
+                prev = conn.execute(
+                    "SELECT status FROM scan_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if prev is not None:
+                    was_completed = str(prev["status"] or "") == "completed"
+                conn.execute(
+                    """
+                    UPDATE scan_sessions SET
+                        picker_name = ?, checker_name = ?, check_date = ?,
+                        check_time = ?, sales_order_no = ?, no_of_boxes = ?,
+                        picking_correct = ?, item_correct = ?, status = ?,
+                        ticket_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        picker_name.strip(),
+                        checker_name.strip(),
+                        check_date,
+                        (check_time or "").strip(),
+                        sales_order_no.strip(),
+                        no_of_boxes.strip(),
+                        int(picking_correct),
+                        int(item_correct),
+                        status,
+                        ticket_json,
+                        now,
+                        session_id,
+                    ),
+                )
+                conn.execute("DELETE FROM scan_items WHERE session_id = ?", (session_id,))
+                sid = session_id
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO scan_sessions (
+                        picker_name, checker_name, check_date, check_time, sales_order_no,
+                        no_of_boxes, picking_correct, item_correct, status,
+                        ticket_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        picker_name.strip(),
+                        checker_name.strip(),
+                        check_date,
+                        (check_time or "").strip(),
+                        sales_order_no.strip(),
+                        no_of_boxes.strip(),
+                        int(picking_correct),
+                        int(item_correct),
+                        status,
+                        ticket_json,
+                        now,
+                        now,
+                    ),
+                )
+                sid = cursor.lastrowid
 
-        for item in items:
-            conn.execute(
-                """
-                INSERT INTO scan_items (
-                    session_id, item_scanned, part_no, description, qty,
-                    match_status, set_qty, box_qty, pallet_qty
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (sid, *_item_row(item)),
-            )
-        _remember_picker_name(conn, picker_name)
+            for item in items:
+                conn.execute(
+                    """
+                    INSERT INTO scan_items (
+                        session_id, item_scanned, part_no, description, qty,
+                        match_status, set_qty, box_qty, pallet_qty
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (sid, *_item_row(item)),
+                )
+            _remember_picker_name(conn, picker_name)
+            return int(sid), was_completed
+
+    sid, was_completed = retry_locked(write)
 
     if status == "completed" and not was_completed:
         try:
@@ -301,8 +318,7 @@ def search_sessions(
     status: str | None = None,
     limit: int = 500,
 ) -> list[dict[str, Any]]:
-    with _connect() as conn:
-        _migrate(conn)
+    with _db() as conn:
         query = """
             SELECT s.*,
                 COUNT(i.id) AS scan_count,
@@ -360,11 +376,16 @@ def get_sessions_with_items(session_ids: list[int] | None = None) -> list[dict[s
 
 
 def delete_all_sessions() -> int:
-    with _connect() as conn:
-        count = conn.execute("SELECT COUNT(*) AS count FROM scan_sessions").fetchone()["count"]
-        conn.execute("DELETE FROM scan_items")
-        conn.execute("DELETE FROM scan_sessions")
-        return int(count)
+    def wipe() -> int:
+        with _db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) AS count FROM scan_sessions"
+            ).fetchone()["count"]
+            conn.execute("DELETE FROM scan_items")
+            conn.execute("DELETE FROM scan_sessions")
+            return int(count)
+
+    return retry_locked(wipe)
 
 
 def list_drafts(limit: int = 20) -> list[dict[str, Any]]:
@@ -373,8 +394,7 @@ def list_drafts(limit: int = 20) -> list[dict[str, Any]]:
 
 def session_stats() -> dict[str, int]:
     """Return total session counts keyed by status plus ``total``."""
-    with _connect() as conn:
-        _migrate(conn)
+    with _db() as conn:
         rows = conn.execute(
             "SELECT status, COUNT(*) AS count FROM scan_sessions GROUP BY status"
         ).fetchall()
@@ -490,8 +510,7 @@ def fulfilment_stats_by_picker(
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Return (picks_by_picker, lines_by_picker) for completed sessions."""
     today = date.today().strftime("%d/%m/%Y")
-    with _connect() as conn:
-        _migrate(conn)
+    with _db() as conn:
         sessions = conn.execute(
             """
             SELECT id, picker_name, check_date, ticket_json
@@ -548,8 +567,7 @@ def fulfilment_daily_stats(
     """Return per-day (picks, lines) maps: ``{YYYY-MM-DD: {picker: count}}``."""
     if end < start:
         start, end = end, start
-    with _connect() as conn:
-        _migrate(conn)
+    with _db() as conn:
         sessions = conn.execute(
             """
             SELECT id, picker_name, check_date, ticket_json
@@ -651,27 +669,33 @@ def local_fulfilment_snapshot(
     }
 
 def get_session(session_id: int) -> dict[str, Any] | None:
-    with _connect() as conn:
-        session = conn.execute(
-            "SELECT * FROM scan_sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        if not session:
-            return None
-        items = conn.execute(
-            "SELECT * FROM scan_items WHERE session_id = ? ORDER BY id",
-            (session_id,),
-        ).fetchall()
-    result = dict(session)
-    result["items"] = [dict(row) for row in items]
-    if result.get("ticket_json"):
-        result["picking_ticket"] = ticket_from_dict(json.loads(result["ticket_json"]))
-    return result
+    def load() -> dict[str, Any] | None:
+        with _db() as conn:
+            session = conn.execute(
+                "SELECT * FROM scan_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if not session:
+                return None
+            items = conn.execute(
+                "SELECT * FROM scan_items WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        result = dict(session)
+        result["items"] = [dict(row) for row in items]
+        if result.get("ticket_json"):
+            result["picking_ticket"] = ticket_from_dict(json.loads(result["ticket_json"]))
+        return result
+
+    return retry_locked(load)
 
 
 def delete_session(session_id: int) -> None:
-    with _connect() as conn:
-        conn.execute("DELETE FROM scan_items WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM scan_sessions WHERE id = ?", (session_id,))
+    def wipe() -> None:
+        with _db() as conn:
+            conn.execute("DELETE FROM scan_items WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM scan_sessions WHERE id = ?", (session_id,))
+
+    retry_locked(wipe)
 
 
 def lookup_barcode(barcode: str) -> dict[str, str] | None:
