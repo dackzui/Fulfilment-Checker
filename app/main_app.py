@@ -807,7 +807,7 @@ def main(page: ft.Page):
                             ),
                             ft.Text(str(exc), size=14, color=TEXT, font_family=FONT_FAMILY),
                             ft.Text(
-                                "Reinstall v1.8.28+ or send startup_err.txt from app data.",
+                                "Reinstall v1.8.29+ or send startup_err.txt from app data.",
                                 size=12,
                                 color="#616161",
                                 font_family=FONT_FAMILY,

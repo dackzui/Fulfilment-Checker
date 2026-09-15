@@ -21,7 +21,7 @@ from app.theme import (
 
 def nav_button(label: str, icon: str, active: bool, on_click) -> ft.Container:
     return ft.Container(
-        content=ft.ElevatedButton(
+        content=ft.Button(
             content=ft.Row(
                 [
                     ft.Icon(icon, color=ft.Colors.WHITE, size=22),
@@ -109,10 +109,10 @@ def action_button(
     on_click=None,
     bgcolor: str | None = None,
     hover: str | None = None,
-) -> ft.ElevatedButton:
+) -> ft.Button:
     bg = bgcolor or (PRIMARY if primary else DANGER)
     hover_bg = hover or (PRIMARY_HOVER if primary else DANGER_HOVER)
-    return ft.ElevatedButton(
+    return ft.Button(
         content=ft.Row(
             [
                 ft.Icon(icon, color=ft.Colors.WHITE, size=18),

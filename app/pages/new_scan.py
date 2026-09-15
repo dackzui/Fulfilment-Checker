@@ -849,7 +849,7 @@ def build(
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=close_add),
-                    ft.ElevatedButton(
+                    ft.Button(
                         "Add line",
                         bgcolor=PRIMARY,
                         color=ft.Colors.WHITE,
@@ -933,7 +933,7 @@ def build(
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=close_login),
-                    ft.ElevatedButton(
+                    ft.Button(
                         "Continue",
                         bgcolor=PRIMARY,
                         color=ft.Colors.WHITE,
@@ -1027,7 +1027,7 @@ def build(
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=close_prompt),
-                    ft.ElevatedButton(
+                    ft.Button(
                         "Checker add line",
                         bgcolor=PRIMARY,
                         color=ft.Colors.WHITE,
@@ -1451,7 +1451,7 @@ def build(
         show_snack(f"Scan completed — checking #{session_id} saved.")
         navigate("history", session_id=session_id)
 
-    upload_button = ft.ElevatedButton(
+    upload_button = ft.Button(
         "Upload Picking Ticket",
         icon=ft.Icons.UPLOAD_FILE,
         bgcolor=PRIMARY,
@@ -1460,7 +1460,7 @@ def build(
         on_click=lambda _: page.run_task(handle_pdf_pick),
     )
 
-    add_item_button = ft.ElevatedButton(
+    add_item_button = ft.Button(
         "Add Item",
         icon=ft.Icons.ADD,
         bgcolor="#6A1B9A",

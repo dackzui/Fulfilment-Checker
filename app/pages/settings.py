@@ -666,7 +666,7 @@ def build(
         ),
         ft.Row(
             [
-                ft.ElevatedButton(
+                ft.Button(
                     "Refresh",
                     icon=ft.Icons.REFRESH,
                     bgcolor=PRIMARY if is_admin else "#9E9E9E",

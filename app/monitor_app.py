@@ -573,7 +573,7 @@ async def main(page: ft.Page):
                         username_field,
                         password_field,
                         status,
-                        ft.ElevatedButton(
+                        ft.Button(
                             "Sign in",
                             bgcolor=PRIMARY,
                             color=ft.Colors.WHITE,
@@ -2118,7 +2118,7 @@ async def main(page: ft.Page):
                                     height=48,
                                     on_click=open_fleet_date_to_picker,
                                 ),
-                                ft.ElevatedButton(
+                                ft.Button(
                                     "Save schedule",
                                     icon=ft.Icons.SAVE,
                                     bgcolor=PRIMARY,
@@ -2144,7 +2144,7 @@ async def main(page: ft.Page):
                         ),
                         ft.Row(
                             [
-                                ft.ElevatedButton(
+                                ft.Button(
                                     "Force download now",
                                     icon=ft.Icons.DOWNLOAD_FOR_OFFLINE,
                                     bgcolor="#C62828",
@@ -2223,7 +2223,7 @@ async def main(page: ft.Page):
                         barcode_cloud_status,
                         ft.Row(
                             [
-                                ft.ElevatedButton(
+                                ft.Button(
                                     "Upload & publish to tablets",
                                     icon=ft.Icons.UPLOAD_FILE,
                                     bgcolor=PRIMARY,
@@ -2323,7 +2323,7 @@ async def main(page: ft.Page):
                             "Picker users appear in the New Scan dropdown on tablets. "
                             "Accounts sync when Firebase is set up."
                         ),
-                        ft.ElevatedButton(
+                        ft.Button(
                             "Add User / Picker",
                             icon=ft.Icons.PERSON_ADD,
                             bgcolor=PRIMARY,
@@ -2455,7 +2455,7 @@ async def main(page: ft.Page):
                                 prize_field,
                                 ft.Row(
                                     [
-                                        ft.ElevatedButton(
+                                        ft.Button(
                                             "Save prize",
                                             bgcolor=PRIMARY,
                                             color=ft.Colors.WHITE,

@@ -165,7 +165,7 @@ def build(
 
     quick_actions = ft.Row(
         [
-            ft.ElevatedButton(
+            ft.Button(
                 "Start New Scan",
                 icon=ft.Icons.QR_CODE_SCANNER,
                 bgcolor=PRIMARY,

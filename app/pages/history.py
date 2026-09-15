@@ -387,7 +387,7 @@ def build(
 
     def status_chip(label: str, value: str) -> ft.Control:
         if status_value["value"] == value:
-            return ft.ElevatedButton(
+            return ft.Button(
                 label,
                 height=MIN_TOUCH,
                 on_click=lambda _: set_status(value),
@@ -443,7 +443,7 @@ def build(
                         status_chip("All", "all"),
                         status_chip("Completed", "completed"),
                         status_chip("Draft", "draft"),
-                        ft.ElevatedButton(
+                        ft.Button(
                             "Apply Filters",
                             icon=ft.Icons.SEARCH,
                             height=MIN_TOUCH,
@@ -809,7 +809,7 @@ def _build_detail(
     actions = ft.Row(spacing=10, wrap=True)
     if is_draft:
         actions.controls.append(
-            ft.ElevatedButton(
+            ft.Button(
                 "Resume",
                 icon=ft.Icons.PLAY_ARROW,
                 bgcolor=PRIMARY,
