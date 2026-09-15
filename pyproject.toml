@@ -5,7 +5,8 @@ description = "Picking Barcode Scanner - warehouse picking verification"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "flet[all]==0.85.3",
+    # Keep base flet for Android packaging. Workflows install flet[all] for the CLI only.
+    "flet==0.85.3",
     "pdfminer.six>=20221105",
     # pymupdf has no Android wheels — desktop optional only (see optional-dependencies)
     "openpyxl>=3.1.0",
@@ -27,8 +28,8 @@ org = "com.deks"
 product = "Picking Barcode Scanner"
 company = "DEKS"
 copyright = "Copyright (C) 2026 DEKS Industries Pty Ltd"
-build_version = "1.8.29"
-build_number = 47
+build_version = "1.8.30"
+build_number = 48
 
 [tool.flet.app]
 path = "."
