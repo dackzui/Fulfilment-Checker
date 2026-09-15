@@ -46,6 +46,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     session_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(scan_sessions)").fetchall()
     }
+    # Tables may not exist yet (init_db creates them first). Skip ALTERs until then.
+    if not session_cols:
+        return
+
     if "ticket_json" not in session_cols:
         conn.execute("ALTER TABLE scan_sessions ADD COLUMN ticket_json TEXT")
     if "updated_at" not in session_cols:
@@ -123,43 +127,53 @@ def delete_picker_name(name: str) -> None:
 
 def init_db() -> None:
     def setup() -> None:
-        with _db() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS scan_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    picker_name TEXT NOT NULL,
-                    checker_name TEXT NOT NULL,
-                    check_date TEXT NOT NULL,
-                    check_time TEXT,
-                    sales_order_no TEXT NOT NULL,
-                    no_of_boxes TEXT,
-                    picking_correct INTEGER NOT NULL DEFAULT 0,
-                    item_correct INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'completed',
-                    ticket_json TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT
-                );
+        # Create tables BEFORE migrate. Do not use _db() here — it migrates first
+        # and would ALTER non-existent tables on a fresh install.
+        with DB_LOCK:
+            with _connect() as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS scan_sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        picker_name TEXT NOT NULL,
+                        checker_name TEXT NOT NULL,
+                        check_date TEXT NOT NULL,
+                        check_time TEXT,
+                        sales_order_no TEXT NOT NULL,
+                        no_of_boxes TEXT,
+                        picking_correct INTEGER NOT NULL DEFAULT 0,
+                        item_correct INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'completed',
+                        ticket_json TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT
+                    );
 
-                CREATE TABLE IF NOT EXISTS scan_items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id INTEGER NOT NULL,
-                    item_scanned TEXT NOT NULL,
-                    part_no TEXT,
-                    description TEXT,
-                    qty INTEGER NOT NULL DEFAULT 1,
-                    match_status TEXT,
-                    set_qty INTEGER,
-                    box_qty INTEGER,
-                    pallet_qty INTEGER,
-                    FOREIGN KEY (session_id) REFERENCES scan_sessions(id)
-                );
-                """
-            )
+                    CREATE TABLE IF NOT EXISTS scan_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL,
+                        item_scanned TEXT NOT NULL,
+                        part_no TEXT,
+                        description TEXT,
+                        qty INTEGER NOT NULL DEFAULT 1,
+                        match_status TEXT,
+                        set_qty INTEGER,
+                        box_qty INTEGER,
+                        pallet_qty INTEGER,
+                        FOREIGN KEY (session_id) REFERENCES scan_sessions(id)
+                    );
+                    """
+                )
+                global _schema_ready
+                _schema_ready = False
+                _migrate(conn)
 
     retry_locked(setup)
-    barcode_catalog.ensure_loaded()
+    # Missing master list must not block app launch (cloud sync can fill it later).
+    try:
+        barcode_catalog.ensure_loaded()
+    except Exception:
+        pass
 
 
 def _item_row(item: dict[str, Any]) -> tuple:

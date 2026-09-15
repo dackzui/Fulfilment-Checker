@@ -21,9 +21,21 @@ def connect(db_path: Path, *, timeout: float = 60.0) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     # busy_timeout is in milliseconds — wait instead of failing immediately.
     conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA temp_store=MEMORY")
+    # WAL is ideal, but some Android storage setups reject it — fall back safely.
+    try:
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        if mode and str(mode[0]).lower() != "wal":
+            conn.execute("PRAGMA journal_mode=DELETE")
+    except sqlite3.Error:
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+        except sqlite3.Error:
+            pass
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+    except sqlite3.Error:
+        pass
     return conn
 
 
