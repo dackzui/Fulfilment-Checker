@@ -494,15 +494,23 @@ def build(
                         pass
                 snap = firebase_presence.dashboard_snapshot()
 
-                def apply():
+                async def apply():
                     apply_snapshot(snap)
                     page.update()
 
-                apply()
-            except Exception as exc:
-                dash_status.value = f"Dashboard update failed: {exc}"
                 try:
+                    page.run_task(apply)
+                except Exception:
+                    apply_snapshot(snap)
+            except Exception as exc:
+                message = str(exc)
+
+                async def show_err():
+                    dash_status.value = f"Dashboard update failed: {message}"
                     page.update()
+
+                try:
+                    page.run_task(show_err)
                 except Exception:
                     pass
 
@@ -549,6 +557,8 @@ def build(
     page._home_dashboard_token = refresh_token
 
     def auto_refresh_loop():
+        # Let the first Home paint finish before Firebase/network work.
+        time.sleep(0.4)
         while getattr(page, "_home_dashboard_token", None) == refresh_token:
             try:
                 if firebase_presence.is_configured():
@@ -562,22 +572,31 @@ def build(
                         pass
                 snap = firebase_presence.dashboard_snapshot()
 
-                def apply():
+                async def apply():
                     if getattr(page, "_home_dashboard_token", None) != refresh_token:
                         return
                     apply_snapshot(snap)
                     page.update()
 
-                apply()
+                try:
+                    page.run_task(apply)
+                except Exception:
+                    # Fallback if run_task unavailable mid-teardown.
+                    if getattr(page, "_home_dashboard_token", None) == refresh_token:
+                        apply_snapshot(snap)
             except Exception as exc:
+                message = str(exc)
 
-                def show_err(message=str(exc)):
+                async def show_err():
                     if getattr(page, "_home_dashboard_token", None) != refresh_token:
                         return
                     dash_status.value = f"Dashboard update failed: {message}"
                     page.update()
 
-                show_err()
+                try:
+                    page.run_task(show_err)
+                except Exception:
+                    pass
             for _ in range(_DASHBOARD_REFRESH_SECONDS):
                 if getattr(page, "_home_dashboard_token", None) != refresh_token:
                     return

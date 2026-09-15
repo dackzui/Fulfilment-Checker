@@ -25,7 +25,7 @@ def _db_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
-    return sqlite_connect(_db_path(), timeout=60.0)
+    return sqlite_connect(_db_path(), timeout=15.0)
 
 
 @contextmanager
@@ -129,51 +129,71 @@ def init_db() -> None:
     def setup() -> None:
         # Create tables BEFORE migrate. Do not use _db() here — it migrates first
         # and would ALTER non-existent tables on a fresh install.
-        with DB_LOCK:
-            with _connect() as conn:
-                conn.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS scan_sessions (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        picker_name TEXT NOT NULL,
-                        checker_name TEXT NOT NULL,
-                        check_date TEXT NOT NULL,
-                        check_time TEXT,
-                        sales_order_no TEXT NOT NULL,
-                        no_of_boxes TEXT,
-                        picking_correct INTEGER NOT NULL DEFAULT 0,
-                        item_correct INTEGER NOT NULL DEFAULT 0,
-                        status TEXT NOT NULL DEFAULT 'completed',
-                        ticket_json TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT
-                    );
+        # retry_locked() already holds DB_LOCK — do not nest another acquire.
+        with _connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS scan_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    picker_name TEXT NOT NULL,
+                    checker_name TEXT NOT NULL,
+                    check_date TEXT NOT NULL,
+                    check_time TEXT,
+                    sales_order_no TEXT NOT NULL,
+                    no_of_boxes TEXT,
+                    picking_correct INTEGER NOT NULL DEFAULT 0,
+                    item_correct INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    ticket_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT
+                );
 
-                    CREATE TABLE IF NOT EXISTS scan_items (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        session_id INTEGER NOT NULL,
-                        item_scanned TEXT NOT NULL,
-                        part_no TEXT,
-                        description TEXT,
-                        qty INTEGER NOT NULL DEFAULT 1,
-                        match_status TEXT,
-                        set_qty INTEGER,
-                        box_qty INTEGER,
-                        pallet_qty INTEGER,
-                        FOREIGN KEY (session_id) REFERENCES scan_sessions(id)
-                    );
-                    """
-                )
-                global _schema_ready
-                _schema_ready = False
-                _migrate(conn)
+                CREATE TABLE IF NOT EXISTS scan_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    item_scanned TEXT NOT NULL,
+                    part_no TEXT,
+                    description TEXT,
+                    qty INTEGER NOT NULL DEFAULT 1,
+                    match_status TEXT,
+                    set_qty INTEGER,
+                    box_qty INTEGER,
+                    pallet_qty INTEGER,
+                    FOREIGN KEY (session_id) REFERENCES scan_sessions(id)
+                );
+                """
+            )
+            global _schema_ready
+            _schema_ready = False
+            _migrate(conn)
 
-    retry_locked(setup)
-    # Missing master list must not block app launch (cloud sync can fill it later).
     try:
-        barcode_catalog.ensure_loaded()
+        retry_locked(setup)
+    except sqlite3.OperationalError:
+        # Stale WAL/SHM from a crashed prior version can freeze Android startups.
+        for suffix in ("-wal", "-shm"):
+            side = Path(str(_db_path()) + suffix)
+            try:
+                side.unlink(missing_ok=True)
+            except Exception:
+                pass
+        retry_locked(setup)
+    # Never block app launch on barcode Excel import — sync later in background.
+    def load_catalog() -> None:
+        try:
+            barcode_catalog.ensure_loaded()
+        except Exception:
+            pass
+
+    try:
+        import threading
+
+        threading.Thread(
+            target=load_catalog, name="barcode-catalog-load", daemon=True
+        ).start()
     except Exception:
-        pass
+        load_catalog()
 
 
 def _item_row(item: dict[str, Any]) -> tuple:

@@ -94,7 +94,7 @@ def _save_config_path() -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    return sqlite_connect(_db_path(), timeout=60.0)
+    return sqlite_connect(_db_path(), timeout=15.0)
 
 
 @contextmanager

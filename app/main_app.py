@@ -98,10 +98,37 @@ class ScannerApp:
             spacing=0,
         )
         page.add(self.layout)
-        self.navigate("home")
-        self._start_update_check()
-        self._start_auto_sync_scheduler()
-        self._start_presence_scheduler()
+        try:
+            self.navigate("home")
+        except Exception as exc:
+            self.page_body.content = ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Home failed to load",
+                            size=20,
+                            weight=ft.FontWeight.BOLD,
+                            color="#C62828",
+                            font_family=FONT_FAMILY,
+                        ),
+                        ft.Text(str(exc), color=TEXT, font_family=FONT_FAMILY),
+                        ft.OutlinedButton(
+                            "Open New Scan",
+                            icon=ft.Icons.QR_CODE_SCANNER,
+                            on_click=lambda _: self.navigate("new_scan"),
+                        ),
+                    ],
+                    spacing=12,
+                ),
+                padding=24,
+            )
+            self.page.update()
+        try:
+            self._start_update_check()
+            self._start_auto_sync_scheduler()
+            self._start_presence_scheduler()
+        except Exception:
+            pass
 
     def _start_auto_sync_scheduler(self) -> None:
         from app import scheduled_sync
@@ -707,21 +734,92 @@ class ScannerApp:
 
 
 def main(page: ft.Page):
+    # Show something immediately so Android never sits on a blank frame.
+    page.bgcolor = BG_MAIN
+    page.padding = 24
+    status = ft.Text(
+        "Starting Picking Barcode Scanner…",
+        size=18,
+        color=TEXT,
+        font_family=FONT_FAMILY,
+    )
+    page.add(status)
+    page.update()
+
     async def bootstrap():
-        await init_app_storage(page)
-        if not page.web and not page.platform.is_mobile():
-            page.window.width = 1280
-            page.window.height = 800
-            page.window.min_width = 900
-            page.window.min_height = 600
-            page.window.max_width = None
-            page.window.max_height = None
-            page.window.resizable = True
-            page.window.maximizable = True
-            page.window.minimizable = True
-            page.window.full_screen = False
-            await page.window.center()
-            await page.window.to_front()
-        ScannerApp(page)
+        try:
+            status.value = "Preparing storage…"
+            page.update()
+            await init_app_storage(page)
+
+            if not page.web and not page.platform.is_mobile():
+                page.window.width = 1280
+                page.window.height = 800
+                page.window.min_width = 900
+                page.window.min_height = 600
+                page.window.max_width = None
+                page.window.max_height = None
+                page.window.resizable = True
+                page.window.maximizable = True
+                page.window.minimizable = True
+                page.window.full_screen = False
+                await page.window.center()
+                await page.window.to_front()
+
+            status.value = "Loading app…"
+            page.update()
+            # Keep the status text until ScannerApp has added the real UI.
+            # Clearing first can leave Android on a blank frame if init fails mid-way.
+            page.padding = 0
+            ScannerApp(page)
+            try:
+                if status in page.controls:
+                    page.controls.remove(status)
+            except Exception:
+                # Fall back: drop any leftover bootstrap controls except the app shell.
+                if len(page.controls) > 1:
+                    page.controls[:] = page.controls[-1:]
+            page.update()
+        except Exception as exc:
+            import traceback
+
+            details = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+            try:
+                from app.paths import get_data_dir
+
+                err_path = get_data_dir() / "startup_err.txt"
+                err_path.write_text(details, encoding="utf-8")
+            except Exception:
+                pass
+            page.controls.clear()
+            page.add(
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                "App failed to start",
+                                size=22,
+                                weight=ft.FontWeight.BOLD,
+                                color="#C62828",
+                                font_family=FONT_FAMILY,
+                            ),
+                            ft.Text(str(exc), size=14, color=TEXT, font_family=FONT_FAMILY),
+                            ft.Text(
+                                "Reinstall v1.8.28+ or send startup_err.txt from app data.",
+                                size=12,
+                                color="#616161",
+                                font_family=FONT_FAMILY,
+                            ),
+                        ],
+                        spacing=12,
+                        scroll=ft.ScrollMode.AUTO,
+                    ),
+                    padding=24,
+                    expand=True,
+                )
+            )
+            page.update()
 
     page.run_task(bootstrap)
